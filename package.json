@@ -1,15 +1,26 @@
 {
   "name": "folder-structure-sync",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "🚀 Interactive CLI tool for syncing folder structures with smart selection, dependency handling, and beautiful output",
   "main": "index.js",
   "bin": {
-    "folder-sync": "./index.js"
+    "folder-sync": "index.js"
   },
   "scripts": {
     "start": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "demo": "node index.js --help"
+    "demo": "node index.js --help",
+    "precheck": "node scripts/pre-publish-check.js",
+    "test-package": "node scripts/test-package.js",
+    "release:patch": "node scripts/release.js patch",
+    "release:minor": "node scripts/release.js minor",
+    "release:major": "node scripts/release.js major",
+    "publish:check": "npm run precheck && npm run test-package",
+    "publish:safe": "npm run publish:check && npm publish",
+    "workflow:stats": "node scripts/workflow.js stats",
+    "workflow:social": "node scripts/workflow.js social",
+    "workflow:promotion": "node scripts/workflow.js promotion",
+    "workflow:commands": "node scripts/workflow.js commands"
   },
   "repository": {
     "type": "git",

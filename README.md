@@ -1,7 +1,23 @@
 # 📁 Folder Structure Sync
 
 [![npm version](https://img.shields.io/npm/v/folder-structure-sync.svg)](https://www.npmjs.com/package/folder-structure-sync)
-[![License: ISC](https://img.shields.io/badge/License-ISC-blue.svg)](https://opensource.org/licenses/ISC)
+[![License: ISC](https://img.shields.io/badge/Lice```bash
+
+# Clone and setup for development
+
+git clone https://github.com/unique01082/folder-structure-sync.git
+cd folder-structure-sync
+npm install
+
+# Run tests (when available)
+
+npm test
+
+# Test with sample data
+
+node index.js ./test-source ./test-target --dry-run
+
+````.svg)](https://opensource.org/licenses/ISC)
 [![Node.js Version](https://img.shields.io/badge/node-%3E%3D12.0.0-brightgreen.svg)](https://nodejs.org/)
 
 > 🚀 **Interactive CLI tool for syncing folder structures with smart selection, dependency handling, and beautiful output**
@@ -24,31 +40,33 @@ Perfect for project templates, development environments, team onboarding, and au
 ## 🚀 Quick Start
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/folder-structure-sync.git
-cd folder-structure-sync
+# Install globally from npm
+npm install -g folder-structure-sync
 
-# Install dependencies
-npm install
+# Or install locally in your project
+npm install folder-structure-sync
 
 # Run interactively
-node index.js ./source-folder ./target-folder
+folder-sync ./source-folder ./target-folder
 
 # Preview changes (recommended first run)
-node index.js ./source-folder ./target-folder --dry-run
+folder-sync ./source-folder ./target-folder --dry-run
 
 # Auto-sync everything
-node index.js ./source-folder ./target-folder --auto
-```
+folder-sync ./source-folder ./target-folder --auto
+````
 
 ## 📦 Installation
 
 ```bash
-# Local installation
-npm install
-
-# Global installation (coming soon)
+# Global installation (recommended)
 npm install -g folder-structure-sync
+
+# Local installation
+npm install folder-structure-sync
+
+# Or run directly with npx (no installation needed)
+npx folder-structure-sync ./source ./target --dry-run
 ```
 
 ## 📖 Usage
@@ -58,7 +76,7 @@ npm install -g folder-structure-sync
 The default mode provides a user-friendly selection interface:
 
 ```bash
-node index.js ./source-project ./target-project
+folder-sync ./source-project ./target-project
 ```
 
 **Example interaction:**
@@ -86,19 +104,19 @@ node index.js ./source-project ./target-project
 
 ```bash
 # 🔍 Preview changes (recommended first!)
-node index.js ./my-template ./new-project --dry-run
+folder-sync ./my-template ./new-project --dry-run
 
 # 🏗️ Project template setup
-node index.js ./project-template ./new-project --auto
+folder-sync ./project-template ./new-project --auto
 
 # 👥 Team environment replication
-node index.js ./team-structure ./my-local-copy
+folder-sync ./team-structure ./my-local-copy
 
 # 📦 Selective sync with verbose output
-node index.js ./large-project ./partial-copy --verbose
+folder-sync ./large-project ./partial-copy --verbose
 
 # 🤖 Automation/CI-CD pipeline
-node index.js "$SOURCE" "$TARGET" --auto
+folder-sync "$SOURCE" "$TARGET" --auto
 ```
 
 ## ⚙️ Configuration
@@ -202,7 +220,7 @@ Progress |████████████████████| 100% | 5
 
 ```bash
 # Clone and setup
-git clone https://github.com/yourusername/folder-structure-sync.git
+git clone https://github.com/unique01082/folder-structure-sync.git
 cd folder-structure-sync
 npm install
 
@@ -225,7 +243,7 @@ Contributions are welcome! Please feel free to submit a Pull Request. For major 
 
 ## 📋 Roadmap
 
-- [ ] 📦 NPM package publication
+- [x] 📦 NPM package publication
 - [ ] 🧪 Comprehensive test suite
 - [ ] 📊 File sync capabilities (not just folders)
 - [ ] 🌐 Configuration presets for popular frameworks
@@ -264,4 +282,4 @@ This project is licensed under the ISC License - see the [LICENSE](LICENSE) file
 
 ---
 
-**⭐ Star this repo if it helped you!** | **🐛 [Report bugs](https://github.com/yourusername/folder-structure-sync/issues)** | **💡 [Request features](https://github.com/yourusername/folder-structure-sync/issues)**
+**⭐ Star this repo if it helped you!** | **🐛 [Report bugs](https://github.com/unique01082/folder-structure-sync/issues)** | **💡 [Request features](https://github.com/unique01082/folder-structure-sync/issues)**

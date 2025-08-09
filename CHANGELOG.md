@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - 2025-08-09
 
+### 🎉 Initial Release
+
+**Package published to npm:** `npm install -g folder-structure-sync`  
+**NPM Package:** https://www.npmjs.com/package/folder-structure-sync
+
 ### Added
 
 - 🎯 Interactive folder selection with checkbox interface
@@ -49,3 +54,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - No external command execution
 - Local configuration files only
 - No network communication
+
+### Installation
+
+```bash
+# Global installation
+npm install -g folder-structure-sync
+
+# Local installation
+npm install folder-structure-sync
+
+# Use with npx (no installation)
+npx folder-structure-sync source target --dry-run
+```

@@ -5,7 +5,7 @@ Thank you for your interest in contributing! 🎉
 ## 🚀 Quick Start
 
 1. Fork the repository
-2. Clone your fork: `git clone https://github.com/yourusername/folder-structure-sync.git`
+2. Clone your fork: `git clone https://github.com/unique01082/folder-structure-sync.git`
 3. Install dependencies: `npm install`
 4. Create a feature branch: `git checkout -b feature/amazing-feature`
 5. Make your changes
