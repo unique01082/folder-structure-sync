@@ -1,30 +1,38 @@
 # 📁 Folder Structure Sync
 
-[![npm version](https://img.shields.io/npm/v/folder-structure-sync.svg)](https://www.npmjs.com/package/folder-structure-sync)
-[![License: ISC](https://img.shields.io/badge/Lice```bash
-
-# Clone and setup for development
-
-git clone https://github.com/unique01082/folder-structure-sync.git
-cd folder-structure-sync
-npm install
-
-# Run tests (when available)
-
-npm test
-
-# Test with sample data
-
-node index.js ./test-source ./test-target --dry-run
-
-````.svg)](https://opensource.org/licenses/ISC)
-[![Node.js Version](https://img.shields.io/badge/node-%3E%3D12.0.0-brightgreen.svg)](https://nodejs.org/)
+[![npm version](https://img.shields.io/npm/v/folder-structure-sync.svg?style=flat-square)](https://www.npmjs.com/package/folder-structure-sync)
+[![License: ISC](https://img.shields.io/badge/License-ISC-blue.svg?style=flat-square)](https://opensource.org/licenses/ISC)
+[![Node.js Version](https://img.shields.io/badge/node-%3E%3D12.0.0-brightgreen.svg?style=flat-square)](https://nodejs.org/)
 
 > 🚀 **Interactive CLI tool for syncing folder structures with smart selection, dependency handling, and beautiful output**
 
 Perfect for project templates, development environments, team onboarding, and automated deployments. Sync only what you need with intelligent dependency resolution and comprehensive exclusion patterns.
 
-![Demo](https://via.placeholder.com/800x400/2d3748/ffffff?text=🎬+Add+your+demo+GIF+here)
+## 📚 Table of Contents
+
+- [✨ Features](#-features)
+- [🚀 Quick Start](#-quick-start)
+- [📦 Installation](#-installation)
+- [📖 Usage](#-usage)
+  - [🎮 Interactive Mode](#-interactive-mode)
+  - [🔧 Command Options](#-command-options)
+  - [💡 Common Use Cases](#-common-use-cases)
+- [⚙️ Configuration](#️-configuration)
+- [🎯 Smart Features](#-smart-features)
+  - [🎮 Interactive Selection](#-interactive-selection)
+  - [🧠 Dependency Resolution](#-dependency-resolution)
+  - [🎨 Beautiful Output](#-beautiful-output)
+- [📸 Screenshots & Examples](#-screenshots--examples)
+  - [✅ Success Output](#-success-output)
+  - [📋 Dry Run Output](#-dry-run-output)
+  - [⚠️ Error Handling](#️-error-handling)
+- [🛠️ Development](#️-development)
+- [🤝 Contributing](#-contributing)
+- [📋 Roadmap](#-roadmap)
+- [❓ FAQ](#-faq)
+- [🔧 Troubleshooting](#-troubleshooting)
+- [📄 License](#-license)
+- [🙏 Acknowledgments](#-acknowledgments)
 
 ## ✨ Features
 
@@ -54,7 +62,7 @@ folder-sync ./source-folder ./target-folder --dry-run
 
 # Auto-sync everything
 folder-sync ./source-folder ./target-folder --auto
-````
+```
 
 ## 📦 Installation
 
