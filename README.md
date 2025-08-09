@@ -8,6 +8,9 @@
 
 Perfect for project templates, development environments, team onboarding, and automated deployments. Sync only what you need with intelligent dependency resolution and comprehensive exclusion patterns.
 
+<img width="1093" height="485" alt="image" src="https://github.com/user-attachments/assets/d39a7dd1-4f4a-44af-842d-db048e3fc8bd" />
+
+
 ## 📚 Table of Contents
 
 - [✨ Features](#-features)
