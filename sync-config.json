@@ -1,0 +1,26 @@
+{
+  "defaultExclusions": [
+    ".git",
+    ".svn",
+    ".hg",
+    "node_modules",
+    ".npm",
+    ".yarn",
+    "bower_components",
+    ".DS_Store",
+    "Thumbs.db",
+    ".vscode",
+    ".idea",
+    "*.tmp",
+    "*.temp",
+    "*.log",
+    ".cache",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    "coverage",
+    ".nyc_output"
+  ],
+  "customExclusions": []
+}

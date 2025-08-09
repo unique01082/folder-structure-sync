@@ -1,0 +1,59 @@
+{
+  "name": "folder-structure-sync",
+  "version": "0.1.0",
+  "description": "🚀 Interactive CLI tool for syncing folder structures with smart selection, dependency handling, and beautiful output",
+  "main": "index.js",
+  "bin": {
+    "folder-sync": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "demo": "node index.js --help"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/unique01082/folder-structure-sync.git"
+  },
+  "keywords": [
+    "folder",
+    "sync",
+    "directory",
+    "structure",
+    "cli",
+    "interactive",
+    "template",
+    "project-setup",
+    "development",
+    "automation",
+    "filesystem",
+    "folders",
+    "organize"
+  ],
+  "author": {
+    "name": "Bao LE",
+    "email": "bao.lq.it@gmail.com",
+    "url": "https://github.com/unique01082"
+  },
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/unique01082/folder-structure-sync/issues"
+  },
+  "homepage": "https://github.com/unique01082/folder-structure-sync#readme",
+  "engines": {
+    "node": ">=12.0.0"
+  },
+  "files": [
+    "index.js",
+    "sync-config.json",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "cli-progress": "^3.12.0",
+    "commander": "^14.0.0",
+    "inquirer": "^8.2.6"
+  }
+}
