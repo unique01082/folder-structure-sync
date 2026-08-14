@@ -14,7 +14,14 @@ import {
 } from "@rootline/core";
 import { NodeFileSystemAdapter, resolveConfig, type ApplyResult } from "./node-adapter.js";
 
-export const EXIT_CODES = Object.freeze({ SUCCESS: 0, FAILURE: 1, VALIDATION: 2, PARTIAL: 3, CANCELLED: 4 });
+export const EXIT_CODES = Object.freeze({ SUCCESS: 0, FAILURE: 1, USAGE: 2 });
+
+class UsageError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UsageError";
+  }
+}
 
 interface CliOptions {
   readonly source?: string | undefined;
@@ -75,39 +82,23 @@ function parseArguments(arguments_: readonly string[]): CliOptions {
     else if (argument === "--version") showVersion = true;
     else if (argument === "--config") {
       const value = arguments_[index + 1];
-      if (!value) throw configArgumentError();
+      if (!value || value.startsWith("-")) throw configArgumentError();
       configPath = value;
       index += 1;
     } else if (argument.startsWith("-")) {
-      throw createRootlineError({ code: ROOTLINE_ERROR_CODES.CONFIG_INVALID, message: `Unknown option: ${argument}` });
+      throw new UsageError(`Unknown option: ${argument}`);
     } else {
       positional.push(argument);
     }
   }
   if (!help && !showVersion && positional.length !== 2) {
-    throw createRootlineError({ code: ROOTLINE_ERROR_CODES.CONFIG_INVALID, message: "Source and target arguments are required." });
+    throw new UsageError("Source and target arguments are required.");
   }
   return { source: positional[0], target: positional[1], dryRun, verbose, auto, json, configPath, help, version: showVersion };
 }
 
-function configArgumentError(): RootlineError {
-  return createRootlineError({ code: ROOTLINE_ERROR_CODES.CONFIG_INVALID, message: "--config requires a path." });
-}
-
-function exitCodeFor(error: unknown): number {
-  if (!(error instanceof RootlineError)) return EXIT_CODES.FAILURE;
-  if (error.code === ROOTLINE_ERROR_CODES.PARTIAL_FAILURE) return EXIT_CODES.PARTIAL;
-  if (error.code === ROOTLINE_ERROR_CODES.CANCELLED) return EXIT_CODES.CANCELLED;
-  if (
-    error.code === ROOTLINE_ERROR_CODES.CONFIG_INVALID ||
-    error.code === ROOTLINE_ERROR_CODES.INVALID_PATH ||
-    error.code === ROOTLINE_ERROR_CODES.PATH_OVERLAP ||
-    error.code === ROOTLINE_ERROR_CODES.SOURCE_NOT_FOUND ||
-    error.code === ROOTLINE_ERROR_CODES.TARGET_NOT_FOUND ||
-    error.code === ROOTLINE_ERROR_CODES.UNREADABLE_PATH ||
-    error.code === ROOTLINE_ERROR_CODES.STALE_PLAN
-  ) return EXIT_CODES.VALIDATION;
-  return EXIT_CODES.FAILURE;
+function configArgumentError(): UsageError {
+  return new UsageError("--config requires a path.");
 }
 
 async function confirm(message: string): Promise<boolean> {
@@ -133,16 +124,18 @@ export async function run(
     if (options.help) return { output: {}, exitCode: EXIT_CODES.SUCCESS, text: usage() };
     if (options.version) return { output: {}, exitCode: EXIT_CODES.SUCCESS, text: version() };
 
-    const sourcePath = resolve(cwd, options.source!);
-    const targetPath = resolve(cwd, options.target!);
-    const config = await resolveConfig({ cwd, explicitPath: options.configPath });
-    validateRootRelationship(sourcePath, targetPath, config.targetCaseSensitive);
     const adapter = new NodeFileSystemAdapter();
+    const config = await resolveConfig({ cwd, explicitPath: options.configPath });
+    const { sourcePath, targetPath } = await adapter.validateRootPaths(
+      resolve(cwd, options.source!),
+      resolve(cwd, options.target!),
+    );
+    validateRootRelationship(sourcePath, targetPath, config.targetCaseSensitive);
     const source = await adapter.scanDirectories(sourcePath, config.exclusions, "source");
     let targetStatus = await adapter.ensureTarget(targetPath, options.dryRun || !options.auto);
     if (targetStatus === "would-create" && !options.dryRun && !options.json) {
       if (!(await confirmOperation("Create the missing target directory?"))) {
-        return { output: { cancelled: true }, exitCode: EXIT_CODES.CANCELLED };
+        return { output: { cancelled: true }, exitCode: EXIT_CODES.SUCCESS };
       }
       targetStatus = await adapter.ensureTarget(targetPath);
     }
@@ -166,7 +159,7 @@ export async function run(
         return { output: { ...output, cancelled: true }, exitCode: EXIT_CODES.SUCCESS };
       }
       if (!(await confirmOperation(`Create ${plan.missing.length} missing folder(s)?`))) {
-        return { output: { ...output, cancelled: true }, exitCode: EXIT_CODES.CANCELLED };
+        return { output: { ...output, cancelled: true }, exitCode: EXIT_CODES.SUCCESS };
       }
     }
     const result = await adapter.applyDirectories(targetPath, plan, {
@@ -176,14 +169,20 @@ export async function run(
     output.directories = result.directories;
     if (result.directories.some((directory) => directory.status === "failed")) {
       output.error = { code: ROOTLINE_ERROR_CODES.PARTIAL_FAILURE, message: "Some directories could not be created." };
-      return { output, exitCode: EXIT_CODES.PARTIAL };
+      return { output, exitCode: EXIT_CODES.FAILURE };
     }
     return { output, exitCode: EXIT_CODES.SUCCESS };
   } catch (error: unknown) {
     const rootlineError = error instanceof RootlineError
       ? error
-      : createRootlineError({ code: ROOTLINE_ERROR_CODES.INTERNAL, message: error instanceof Error ? error.message : "Unexpected failure." });
-    return { output: { error: { code: rootlineError.code, message: rootlineError.message } }, exitCode: exitCodeFor(rootlineError) };
+      : createRootlineError({
+        code: ROOTLINE_ERROR_CODES.CONFIG_INVALID,
+        message: error instanceof Error ? error.message : "Unexpected failure.",
+      });
+    return {
+      output: { error: { code: rootlineError.code, message: rootlineError.message } },
+      exitCode: error instanceof UsageError ? EXIT_CODES.USAGE : EXIT_CODES.FAILURE,
+    };
   }
 }
 

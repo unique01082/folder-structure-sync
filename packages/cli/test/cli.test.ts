@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -69,18 +69,18 @@ describe("folder-sync command", () => {
     await expect(lstat(target)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("emits JSON validation errors with their documented exit code", async () => {
+  it("emits JSON validation errors with the filesystem-failure exit code", async () => {
     const workspace = await tempDirectory();
     const target = join(workspace, "target");
     await mkdir(target);
 
     const result = run(join(workspace, "missing"), target, "--auto", "--json");
 
-    expect(result.status).toBe(2);
+    expect(result.status).toBe(1);
     expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "SOURCE_NOT_FOUND" } });
   });
 
-  it("rejects an invalid explicit config without writing prose to JSON output", async () => {
+  it("rejects an invalid explicit config as a filesystem/config failure", async () => {
     const workspace = await tempDirectory();
     const source = join(workspace, "source");
     const target = join(workspace, "target");
@@ -89,22 +89,22 @@ describe("folder-sync command", () => {
 
     const result = run(source, target, "--auto", "--json", "--config", config);
 
-    expect(result.status).toBe(2);
+    expect(result.status).toBe(1);
     expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "CONFIG_INVALID" } });
   });
 
-  it("returns the validation exit code for overlapping roots", async () => {
+  it("returns the filesystem-failure exit code for overlapping roots", async () => {
     const workspace = await tempDirectory();
     const source = join(workspace, "source");
     await mkdir(join(source, "nested"), { recursive: true });
 
     const result = run(source, join(source, "nested"), "--auto", "--json");
 
-    expect(result.status).toBe(2);
+    expect(result.status).toBe(1);
     expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "PATH_OVERLAP" } });
   });
 
-  it("returns the partial-failure exit code with per-directory statuses", async () => {
+  it("returns the filesystem-failure exit code with partial mkdir statuses", async () => {
     const workspace = await tempDirectory();
     const source = join(workspace, "source");
     const target = join(workspace, "target");
@@ -116,7 +116,7 @@ describe("folder-sync command", () => {
     const result = run(source, target, "--auto", "--json");
     const output = JSON.parse(result.stdout);
 
-    expect(result.status).toBe(3);
+    expect(result.status).toBe(1);
     expect(output).toMatchObject({ error: { code: "PARTIAL_FAILURE" } });
     expect(output.directories).toEqual(expect.arrayContaining([
       expect.objectContaining({ relativePath: "blocked", status: "failed" }),
@@ -135,7 +135,7 @@ describe("folder-sync command", () => {
     expect(result.stdout).toContain("Source entries: 1");
   });
 
-  it("uses the cancelled exit code when an interactive user declines", async () => {
+  it("treats an interactive user decline as a successful no-op", async () => {
     const workspace = await tempDirectory();
     const source = join(workspace, "source");
     const target = join(workspace, "target");
@@ -143,7 +143,37 @@ describe("folder-sync command", () => {
 
     const result = await runProgram([source, target], workspace, async () => false);
 
-    expect(result.exitCode).toBe(4);
+    expect(result.exitCode).toBe(0);
     expect(result.output).toMatchObject({ cancelled: true });
+  });
+
+  it("uses the usage exit code only for argument parsing errors", async () => {
+    const workspace = await tempDirectory();
+    const source = join(workspace, "source");
+    const target = join(workspace, "target");
+    await Promise.all([mkdir(source), mkdir(target)]);
+
+    const unknownFlag = run(source, target, "--not-a-flag", "--json");
+    const missingConfigValue = run(source, target, "--config", "--json");
+
+    expect(unknownFlag.status).toBe(2);
+    expect(JSON.parse(unknownFlag.stdout)).toMatchObject({ error: { code: "CONFIG_INVALID" } });
+    expect(missingConfigValue.status).toBe(2);
+    expect(JSON.parse(missingConfigValue.stdout)).toMatchObject({ error: { code: "CONFIG_INVALID" } });
+  });
+
+  it("rejects a missing target whose existing ancestor is a source alias before mkdir", async () => {
+    const workspace = await tempDirectory();
+    const source = join(workspace, "source");
+    const alias = join(workspace, "alias");
+    const target = join(alias, "nested");
+    await mkdir(join(source, "planned"), { recursive: true });
+    await symlink(source, alias, "dir");
+
+    const result = run(source, target, "--auto", "--json");
+
+    expect(result.status).toBe(1);
+    expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "PATH_OVERLAP" } });
+    await expect(lstat(join(source, "nested"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

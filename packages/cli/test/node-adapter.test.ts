@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -133,5 +133,24 @@ describe("Node filesystem adapter", () => {
     await expect(adapter.applyDirectories(target, plan, { exclusions: [], sourcePath: sourceRoot })).rejects.toMatchObject({
       code: "STALE_PLAN",
     });
+  });
+
+  it("does not follow a target child symlink introduced after planning", async () => {
+    const sourceRoot = await tempDirectory();
+    const target = await tempDirectory();
+    const external = await tempDirectory();
+    const adapter = new NodeFileSystemAdapter();
+    await mkdir(join(sourceRoot, "parent", "child"), { recursive: true });
+    const source = (await adapter.scanDirectories(sourceRoot, [])).snapshot;
+    const plan = createSyncPlan(source, createSnapshot([]));
+    await symlink(external, join(target, "parent"), "dir");
+
+    const result = await adapter.applyDirectories(target, plan, { exclusions: [], sourcePath: sourceRoot });
+
+    expect(result.directories).toEqual(expect.arrayContaining([
+      expect.objectContaining({ relativePath: "parent", status: "failed" }),
+      expect.objectContaining({ relativePath: "parent/child", status: "failed" }),
+    ]));
+    await expect(lstat(join(external, "child"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

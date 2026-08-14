@@ -1,5 +1,5 @@
 import { promises as fs } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 import {
   ROOTLINE_ERROR_CODES,
@@ -145,6 +145,14 @@ export interface ApplyOptions {
 }
 
 export class NodeFileSystemAdapter {
+  async validateRootPaths(sourcePath: string, targetPath: string): Promise<{ sourcePath: string; targetPath: string }> {
+    const [canonicalSource, canonicalTarget] = await Promise.all([
+      this.canonicalizeExistingPrefix(sourcePath),
+      this.canonicalizeExistingPrefix(targetPath),
+    ]);
+    return { sourcePath: canonicalSource, targetPath: canonicalTarget };
+  }
+
   async scanDirectories(
     rootPath: string,
     exclusions: readonly string[],
@@ -153,21 +161,22 @@ export class NodeFileSystemAdapter {
   ): Promise<DirectoryScan> {
     throwIfCancelled(signal);
     const absoluteRoot = resolve(rootPath);
+    const canonicalRoot = await this.canonicalizeExistingPrefix(absoluteRoot);
     let rootStat;
     try {
-      rootStat = await fs.lstat(absoluteRoot);
+      rootStat = await fs.lstat(canonicalRoot);
     } catch (error: unknown) {
       if (isMissing(error)) {
         throw createRootlineError({
           code: role === "source" ? ROOTLINE_ERROR_CODES.SOURCE_NOT_FOUND : ROOTLINE_ERROR_CODES.TARGET_NOT_FOUND,
           message: `${role === "source" ? "Source" : "Target"} directory does not exist.`,
-          details: { path: absoluteRoot },
+          details: { path: canonicalRoot },
         });
       }
-      throw unreadable(absoluteRoot, error);
+      throw unreadable(canonicalRoot, error);
     }
     if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
-      throw unreadable(absoluteRoot);
+      throw unreadable(canonicalRoot);
     }
 
     const entries: string[] = [];
@@ -208,16 +217,17 @@ export class NodeFileSystemAdapter {
       }
     };
 
-    await visit(absoluteRoot, "");
+    await visit(canonicalRoot, "");
     return { snapshot: createSnapshot(entries), skippedSymlinks: Object.freeze(skippedSymlinks) };
   }
 
   async ensureTarget(targetPath: string, dryRun = false): Promise<"created" | "already-exists" | "would-create"> {
     const absoluteTarget = resolve(targetPath);
+    const canonicalTarget = await this.canonicalizeExistingPrefix(absoluteTarget);
     try {
-      const stat = await fs.lstat(absoluteTarget);
+      const stat = await fs.lstat(canonicalTarget);
       if (!stat.isDirectory() || stat.isSymbolicLink()) {
-        throw unreadable(absoluteTarget);
+        throw unreadable(canonicalTarget);
       }
       return "already-exists";
     } catch (error: unknown) {
@@ -229,10 +239,10 @@ export class NodeFileSystemAdapter {
       return "would-create";
     }
     try {
-      await fs.mkdir(absoluteTarget, { recursive: true });
+      await fs.mkdir(canonicalTarget, { recursive: true });
       return "created";
     } catch (error: unknown) {
-      throw unreadable(absoluteTarget, error);
+      throw unreadable(canonicalTarget, error);
     }
   }
 
@@ -242,9 +252,11 @@ export class NodeFileSystemAdapter {
     options: ApplyOptions,
   ): Promise<ApplyResult> {
     throwIfCancelled(options.signal);
+    const canonicalTarget = await this.canonicalizeExistingPrefix(targetPath);
+    const canonicalSource = await this.canonicalizeExistingPrefix(options.sourcePath);
     const [currentSource, currentTarget] = await Promise.all([
-      this.scanDirectories(options.sourcePath, options.exclusions, "source", options.signal),
-      this.scanDirectories(targetPath, options.exclusions, "target", options.signal),
+      this.scanDirectories(canonicalSource, options.exclusions, "source", options.signal),
+      this.scanDirectories(canonicalTarget, options.exclusions, "target", options.signal),
     ]);
     assertPlanFresh(plan, currentSource.snapshot, currentTarget.snapshot);
     const selected = options.selected ?? plan.missing;
@@ -252,12 +264,20 @@ export class NodeFileSystemAdapter {
     const result: DirectoryResult[] = [];
     for (const relativePath of directories) {
       throwIfCancelled(options.signal);
-      const fullPath = join(resolve(targetPath), ...relativePath.split("/"));
+      const fullPath = join(canonicalTarget, ...relativePath.split("/"));
       if (options.dryRun) {
         result.push({ relativePath, status: "would-create" });
         continue;
       }
       try {
+        if ((await this.canonicalizeExistingPrefix(fullPath)) !== fullPath) {
+          result.push({
+            relativePath,
+            status: "failed",
+            error: "A target path component traverses a symbolic link or junction.",
+          });
+          continue;
+        }
         const existing = await fs.lstat(fullPath).catch((error: unknown) => (isMissing(error) ? undefined : Promise.reject(error)));
         if (existing?.isDirectory()) {
           result.push({ relativePath, status: "already-exists" });
@@ -278,6 +298,32 @@ export class NodeFileSystemAdapter {
       }
     }
     return { directories: Object.freeze(result) };
+  }
+
+  private async canonicalizeExistingPrefix(path: string): Promise<string> {
+    let current = resolve(path);
+    const missing: string[] = [];
+    while (true) {
+      try {
+        await fs.lstat(current);
+        const canonical = await fs.realpath(current);
+        return join(canonical, ...missing);
+      } catch (error: unknown) {
+        if (!isMissing(error)) {
+          throw unreadable(current, error);
+        }
+        const parent = dirname(current);
+        if (parent === current) {
+          throw createRootlineError({
+            code: ROOTLINE_ERROR_CODES.INVALID_PATH,
+            message: "A synchronization root has no existing canonical ancestor.",
+            details: { path },
+          });
+        }
+        missing.unshift(basename(current));
+        current = parent;
+      }
+    }
   }
 }
 
