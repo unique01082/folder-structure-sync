@@ -48,6 +48,18 @@ describe("Rootline synchronization core", () => {
     expect(() => validateRootRelationship("C:\\Source", "c:/source", false)).toThrow("overlap");
   });
 
+  it("does not depend on the host locale for case-insensitive overlap safety", () => {
+    const localeLowerCase = String.prototype.toLocaleLowerCase;
+    String.prototype.toLocaleLowerCase = function localeSensitiveLowerCase(): string {
+      return this.toString();
+    };
+    try {
+      expect(() => validateRootRelationship("/work/I", "/work/i", false)).toThrow("overlap");
+    } finally {
+      String.prototype.toLocaleLowerCase = localeLowerCase;
+    }
+  });
+
   it("uses the target case policy and rejects stale or cancelled work", () => {
     const source = createSnapshot(["Components"]);
     const target = createSnapshot(["components"]);

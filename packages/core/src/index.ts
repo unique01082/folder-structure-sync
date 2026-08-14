@@ -140,7 +140,7 @@ export function selectPlanSubtree(plan: SyncPlan, requested: readonly string[]):
 
 function normalizeRootPath(value: string, caseSensitive: boolean): string {
   const normalized = value.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/$/, "");
-  return caseSensitive ? normalized : normalized.toLocaleLowerCase();
+  return caseSensitive ? normalized : normalized.toLowerCase();
 }
 
 /** Rejects equal, ancestor, and descendant roots before any filesystem mutation. */
