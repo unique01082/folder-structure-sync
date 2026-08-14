@@ -7,7 +7,7 @@
     "moduleResolution": "Bundler",
     "rootDir": "src",
     "outDir": "dist",
-    "types": ["vitest/globals", "@testing-library/jest-dom"]
+    "types": ["vite/client", "vitest/globals", "@testing-library/jest-dom"]
   },
   "include": ["src"]
 }

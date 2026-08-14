@@ -71,6 +71,7 @@ export interface CloudMutationReceipt {
 export interface CloudSyncResponse {
   epoch: string;
   cursor: string;
+  hasMore: boolean;
   records: readonly ProfileRecord[];
   receipts: readonly CloudMutationReceipt[];
 }
@@ -98,6 +99,7 @@ export const ROOTLINE_ERROR_CODES = {
   AUTH_CALLBACK_INVALID: "AUTH_CALLBACK_INVALID",
   PROFILE_CONFLICT: "PROFILE_CONFLICT",
   SYNC_EPOCH_RESET_REQUIRED: "SYNC_EPOCH_RESET_REQUIRED",
+  SYNC_ACCOUNT_CLAIM_REQUIRED: "SYNC_ACCOUNT_CLAIM_REQUIRED",
   RATE_LIMITED: "RATE_LIMITED",
   VALIDATION_FAILED: "VALIDATION_FAILED",
   INTERNAL: "INTERNAL",

@@ -1,0 +1,1 @@
+ALTER TABLE sync_state ADD COLUMN subject TEXT NOT NULL DEFAULT '';

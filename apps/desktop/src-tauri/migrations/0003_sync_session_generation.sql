@@ -1,0 +1,1 @@
+ALTER TABLE sync_state ADD COLUMN session_generation INTEGER NOT NULL DEFAULT 0;

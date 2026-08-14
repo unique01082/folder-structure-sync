@@ -29,5 +29,15 @@
     "icon": [],
     "category": "Utility",
     "shortDescription": "Safe, additive folder-structure synchronization"
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["rootline"]
+      }
+    },
+    "opener": {
+      "openUrl": true
+    }
   }
 }

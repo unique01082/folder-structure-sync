@@ -6,6 +6,7 @@ import { describe, expect, test, vi } from "vitest";
 import { App } from "../App";
 import { DiffTree } from "../components/DiffTree";
 import type { NativeGateway, ScanPlan } from "../native";
+import type { AuthController, AuthSnapshot } from "../auth";
 
 const plan: ScanPlan = {
   operationId: "scan-1",
@@ -190,6 +191,29 @@ describe("Rootline desktop workflow", () => {
     expect(screen.getByRole("tree", { name: "Missing folders" })).toHaveAttribute("aria-multiselectable", "true");
     const results = await axe.run(container);
     expect(results.violations).toEqual([]);
+  });
+
+  test("reconciles visible profiles after hosted sync or destructive cleanup commits", async () => {
+    const user = userEvent.setup();
+    const profile = { id: "remote", name: "Remote", sourcePath: "/private/path", targetPath: "/target", exclusions: [], createdAt: "x", updatedAt: "x" };
+    const listProfiles = vi.fn().mockResolvedValueOnce([profile]).mockResolvedValueOnce([]);
+    const listeners = new Set<(snapshot: AuthSnapshot) => void>();
+    let state: AuthSnapshot = { configured: true, loading: false, dataVersion: 0, user: { sub: "alice", permissions: ["rootline:profiles:sync"] } };
+    const auth: AuthController = {
+      snapshot: () => state,
+      subscribe: (listener) => { listeners.add(listener); listener(state); return () => listeners.delete(listener); },
+      initialize: vi.fn(async () => undefined), signIn: vi.fn(async () => undefined),
+      handleCallback: vi.fn(async () => undefined), signOut: vi.fn(async () => undefined),
+      deleteAccountData: vi.fn(async () => undefined), resolveEpochReset: vi.fn(async () => undefined), resolveAccountClaim: vi.fn(async () => undefined),
+      sync: vi.fn(async () => undefined), dispose: vi.fn(),
+    };
+    render(<App gateway={gateway({ listProfiles })} auth={auth} />);
+    await user.click(await screen.findByRole("option", { name: "Remote" }));
+    expect(screen.getByText("/private/path")).toBeInTheDocument();
+    state = { ...state, dataVersion: 1 };
+    listeners.forEach((listener) => listener(state));
+    await waitFor(() => expect(screen.queryByRole("option", { name: "Remote" })).not.toBeInTheDocument());
+    expect(screen.queryByText("/private/path")).not.toBeInTheDocument();
   });
 });
 

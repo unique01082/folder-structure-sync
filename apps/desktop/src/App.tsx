@@ -1,6 +1,8 @@
 import { useEffect, useId, useRef, useState } from "react";
 
 import { DiffTree } from "./components/DiffTree";
+import { AuthControls } from "./components/AuthControls";
+import type { AuthController, ProfileSyncCoordinator } from "./auth";
 import { copy, type Locale } from "./i18n";
 import {
   nativeFailure,
@@ -18,6 +20,8 @@ type RebindRole = "source" | "target" | null;
 interface AppProps {
   gateway?: NativeGateway;
   initialProfile?: Profile;
+  auth?: AuthController;
+  syncCoordinator?: ProfileSyncCoordinator;
 }
 
 const defaultExclusions = [".git", ".svn", ".hg", "node_modules", ".DS_Store", "Thumbs.db", "dist", "build"];
@@ -37,7 +41,7 @@ function Mark(): React.JSX.Element {
   );
 }
 
-export function App({ gateway = tauriGateway, initialProfile }: AppProps): React.JSX.Element {
+export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordinator }: AppProps): React.JSX.Element {
   const [locale, setLocale] = useState<Locale>("en");
   const text = copy[locale];
   const [profiles, setProfiles] = useState<Profile[]>(initialProfile ? [initialProfile] : []);
@@ -57,16 +61,51 @@ export function App({ gateway = tauriGateway, initialProfile }: AppProps): React
   const returnToScanRef = useRef(false);
   const profileNameId = useId();
 
+  const reconcileProfiles = (loaded: Profile[]): void => {
+    setProfiles(loaded);
+    setActiveProfile((current) => {
+      if (!current) return undefined;
+      const replacement = loaded.find((profile) => profile.id === current.id);
+      if (replacement) {
+        setProfileName(replacement.name);
+        setSourcePath(replacement.sourcePath);
+        setTargetPath(replacement.targetPath);
+      } else {
+        setProfileName("");
+        setSourcePath("");
+        setTargetPath("");
+        setPlan(undefined);
+        setResult(undefined);
+        setStep("choose");
+      }
+      return replacement;
+    });
+  };
+
   useEffect(() => {
     if (initialProfile) return;
     let live = true;
     void gateway.listProfiles().then((loaded) => {
-      if (live) setProfiles(loaded);
+      if (live) reconcileProfiles(loaded);
     }).catch(() => {
       // A first-run database failure is surfaced when the user saves; choosing folders still works.
     });
     return () => { live = false; };
   }, [gateway, initialProfile]);
+
+  useEffect(() => {
+    if (!auth) return;
+    let live = true;
+    let dataVersion = auth.snapshot().dataVersion;
+    const unsubscribe = auth.subscribe((snapshot) => {
+      if (!live || snapshot.dataVersion === dataVersion) return;
+      dataVersion = snapshot.dataVersion;
+      void gateway.listProfiles().then((loaded) => {
+        if (live) reconcileProfiles(loaded);
+      }).catch(() => setError("Local profiles changed, but Rootline could not refresh the list."));
+    });
+    return () => { live = false; unsubscribe(); };
+  }, [auth, gateway]);
 
   useEffect(() => {
     if (step === "choose" && returnToScanRef.current) {
@@ -212,7 +251,7 @@ export function App({ gateway = tauriGateway, initialProfile }: AppProps): React
   const saveProfile = async (): Promise<void> => {
     const now = new Date().toISOString();
     const profile: Profile = {
-      id: activeProfile?.id ?? operationId("profile"),
+      id: activeProfile?.id ?? crypto.randomUUID(),
       name: profileName.trim() || `${text.source} → ${text.target}`,
       sourcePath,
       targetPath,
@@ -224,6 +263,7 @@ export function App({ gateway = tauriGateway, initialProfile }: AppProps): React
     setProfiles((current) => [saved, ...current.filter((entry) => entry.id !== saved.id)]);
     setActiveProfile(saved);
     setProfileName(saved.name);
+    syncCoordinator?.profileEdited();
   };
 
   const createdCount = result?.directories.filter((entry) => entry.status === "created").length ?? 0;
@@ -271,7 +311,10 @@ export function App({ gateway = tauriGateway, initialProfile }: AppProps): React
               ))}
             </ol>
           </nav>
-          <button className="locale-button" type="button" onClick={() => setLocale(locale === "en" ? "vi" : "en")}>{text.localeButton}</button>
+          <div className="topbar-actions">
+            {auth ? <AuthControls auth={auth} {...(syncCoordinator ? { coordinator: syncCoordinator } : {})} /> : null}
+            <button className="locale-button" type="button" onClick={() => setLocale(locale === "en" ? "vi" : "en")}>{text.localeButton}</button>
+          </div>
         </header>
 
         <div className="workspace">

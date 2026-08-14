@@ -15,6 +15,10 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-deep-link": "^2.4.3",
+    "@tauri-apps/plugin-opener": "^2.5.0",
+    "@tauri-apps/plugin-stronghold": "^2.3.0",
+    "oidc-client-ts": "^3.3.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },

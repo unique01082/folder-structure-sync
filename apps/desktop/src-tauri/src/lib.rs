@@ -10,10 +10,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use keyring::Entry;
+use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tauri::{Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
@@ -27,6 +29,10 @@ pub enum NativeErrorCode {
     TargetNotFound,
     UnreadablePath,
     StalePlan,
+    AuthRequired,
+    AuthCallbackInvalid,
+    SyncEpochResetRequired,
+    SyncAccountClaimRequired,
     Internal,
 }
 
@@ -64,6 +70,78 @@ impl From<rusqlite::Error> for NativeError {
             format!("Local database error: {error}"),
         )
     }
+}
+
+fn internal_error(error: impl std::fmt::Display) -> NativeError {
+    NativeError::new(NativeErrorCode::Internal, error.to_string())
+}
+
+pub fn random_vault_password() -> String {
+    let mut key = [0_u8; 32];
+    rand::rng().fill_bytes(&mut key);
+    key.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub fn resolve_existing_vault_password(
+    stored: Result<String, keyring::Error>,
+    snapshot_exists: bool,
+) -> Result<Option<String>, NativeError> {
+    match stored {
+        Ok(password)
+            if password.len() == 64 && password.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            Ok(Some(password))
+        }
+        Ok(_) => Err(NativeError::new(
+            NativeErrorCode::Internal,
+            "The OS credential vault contains an invalid Rootline key.",
+        )),
+        Err(keyring::Error::NoEntry) if snapshot_exists => Err(NativeError::new(
+            NativeErrorCode::Internal,
+            "The Stronghold vault exists but its OS-protected key is missing.",
+        )),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(internal_error(error)),
+    }
+}
+
+#[tauri::command]
+fn auth_vault_password(app: AppHandle) -> Result<String, NativeError> {
+    let directory = app.path().app_data_dir().map_err(internal_error)?;
+    let snapshot = directory.join("rootline-auth.stronghold");
+    let credential =
+        Entry::new("space.baole.rootline", "stronghold-vault-key").map_err(internal_error)?;
+    match resolve_existing_vault_password(credential.get_password(), snapshot.exists())? {
+        Some(password) => Ok(password),
+        None => {
+            let password = random_vault_password();
+            credential.set_password(&password).map_err(internal_error)?;
+            Ok(password)
+        }
+    }
+}
+
+pub fn strict_auth_callback_arg(args: &[String]) -> Option<String> {
+    args.iter().find_map(|argument| {
+        let parsed = url::Url::parse(argument).ok()?;
+        if parsed.scheme() != "rootline"
+            || parsed.host_str() != Some("auth")
+            || parsed.path() != "/callback"
+            || parsed.fragment().is_some()
+        {
+            return None;
+        }
+        let pairs: Vec<_> = parsed.query_pairs().collect();
+        let codes: Vec<_> = pairs
+            .iter()
+            .filter(|(key, value)| key == "code" && !value.is_empty())
+            .collect();
+        let states: Vec<_> = pairs
+            .iter()
+            .filter(|(key, value)| key == "state" && !value.is_empty())
+            .collect();
+        (codes.len() == 1 && states.len() == 1).then(|| argument.clone())
+    })
 }
 
 #[derive(Clone, Default)]
@@ -628,7 +706,19 @@ pub struct RunRecord {
 
 pub struct Database(Mutex<Connection>);
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/0001_offline_state.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/0001_offline_state.sql")),
+    (
+        2,
+        include_str!("../migrations/0002_account_scoped_sync.sql"),
+    ),
+    (
+        3,
+        include_str!("../migrations/0003_sync_session_generation.sql"),
+    ),
+];
+const HOSTED_SYNC_MUTATION_LIMIT: usize = 100;
+const HOSTED_SYNC_BODY_LIMIT: usize = 256 * 1024;
 
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, NativeError> {
@@ -779,7 +869,7 @@ impl Database {
 
     pub fn set_sync_cursor(&self, epoch: &str, cursor: &str) -> Result<(), NativeError> {
         self.connection().execute(
-            "INSERT INTO sync_state(singleton, epoch, cursor) VALUES (1, ?1, ?2)
+            "INSERT INTO sync_state(singleton, epoch, cursor, subject) VALUES (1, ?1, ?2, '')
              ON CONFLICT(singleton) DO UPDATE SET epoch=excluded.epoch, cursor=excluded.cursor",
             params![epoch, cursor],
         )?;
@@ -795,6 +885,427 @@ impl Database {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?)
+    }
+
+    fn sync_binding(&self) -> Result<Option<(String, String, String, i64)>, NativeError> {
+        Ok(self
+            .connection()
+            .query_row(
+                "SELECT subject, epoch, cursor, session_generation FROM sync_state WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?)
+    }
+
+    fn set_sync_binding(
+        &self,
+        subject: &str,
+        epoch: &str,
+        cursor: &str,
+    ) -> Result<(), NativeError> {
+        self.connection().execute(
+            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation) VALUES (1, ?1, ?2, ?3, 1)
+             ON CONFLICT(singleton) DO UPDATE SET subject=excluded.subject, epoch=excluded.epoch,
+             cursor=excluded.cursor, session_generation=sync_state.session_generation + 1",
+            params![subject, epoch, cursor],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_local_synced_data(&self) -> Result<(), NativeError> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM profiles", [])?;
+        transaction.execute("DELETE FROM mutation_outbox", [])?;
+        transaction.execute("DELETE FROM sync_state", [])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn disconnect_hosted_account(
+        &self,
+        remove_local_profiles: bool,
+    ) -> Result<(), NativeError> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM mutation_outbox", [])?;
+        transaction.execute(
+            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation)
+             VALUES (1, '', '', '', 1)
+             ON CONFLICT(singleton) DO UPDATE SET subject='', epoch='', cursor='',
+             session_generation=sync_state.session_generation + 1",
+            [],
+        )?;
+        if remove_local_profiles {
+            transaction.execute("DELETE FROM profiles", [])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn claim_hosted_account(
+        &self,
+        subject: &str,
+        upload_existing: bool,
+    ) -> Result<(), NativeError> {
+        if subject.is_empty() {
+            return Err(NativeError::new(
+                NativeErrorCode::AuthRequired,
+                "An account subject is required.",
+            ));
+        }
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        let owner: Option<String> = transaction
+            .query_row(
+                "SELECT subject FROM sync_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if owner
+            .as_deref()
+            .is_some_and(|value| !value.is_empty() && value != subject)
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::AuthRequired,
+                "Local hosted-sync state belongs to another account.",
+            ));
+        }
+        if owner.as_deref() == Some(subject) {
+            transaction.commit()?;
+            return Ok(());
+        }
+        if !upload_existing {
+            transaction.execute("DELETE FROM mutation_outbox", [])?;
+        }
+        let epoch = Uuid::new_v4().to_string();
+        transaction.execute(
+            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation) VALUES (1, ?1, ?2, '', 1)
+             ON CONFLICT(singleton) DO UPDATE SET subject=excluded.subject, epoch=excluded.epoch,
+             cursor='', session_generation=sync_state.session_generation + 1",
+            params![subject, epoch],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn accept_account_epoch(
+        &self,
+        subject: &str,
+        epoch: &str,
+        remove_local_profiles: bool,
+    ) -> Result<(), NativeError> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM mutation_outbox", [])?;
+        if remove_local_profiles {
+            transaction.execute("DELETE FROM profiles", [])?;
+        }
+        transaction.execute(
+            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation) VALUES (1, ?1, ?2, '', 1)
+             ON CONFLICT(singleton) DO UPDATE SET subject=excluded.subject, epoch=excluded.epoch,
+             cursor='', session_generation=sync_state.session_generation + 1",
+            params![subject, epoch],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn accept_account_epoch_if_current(
+        &self,
+        expected_subject: &str,
+        expected_epoch: &str,
+        expected_cursor: &str,
+        expected_generation: i64,
+        next_epoch: &str,
+        remove_local_profiles: bool,
+    ) -> Result<(), NativeError> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        let current: Option<(String, String, String, i64)> = transaction
+            .query_row(
+                "SELECT subject, epoch, cursor, session_generation FROM sync_state WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        if current.as_ref()
+            != Some(&(
+                expected_subject.to_owned(),
+                expected_epoch.to_owned(),
+                expected_cursor.to_owned(),
+                expected_generation,
+            ))
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::Internal,
+                "Hosted sync state changed; the stale account response was discarded.",
+            ));
+        }
+        transaction.execute("DELETE FROM mutation_outbox", [])?;
+        if remove_local_profiles {
+            transaction.execute("DELETE FROM profiles", [])?;
+        }
+        transaction.execute(
+            "UPDATE sync_state SET epoch=?1, cursor='', session_generation=session_generation + 1
+             WHERE singleton=1 AND subject=?2 AND epoch=?3 AND cursor=?4 AND session_generation=?5",
+            params![
+                next_epoch,
+                expected_subject,
+                expected_epoch,
+                expected_cursor,
+                expected_generation
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn hosted_sync_request(&self, subject: &str) -> Result<serde_json::Value, NativeError> {
+        let device_id = self.device_id()?;
+        let has_unclaimed_mutations = !self.pending_outbox()?.is_empty();
+        let (epoch, cursor) = match self.sync_binding()? {
+            Some((owner, epoch, cursor, _)) if owner == subject => (epoch, cursor),
+            Some((owner, _, _, _)) if owner.is_empty() => {
+                if has_unclaimed_mutations {
+                    return Err(NativeError::new(
+                        NativeErrorCode::SyncAccountClaimRequired,
+                        "Choose whether this account may upload existing local profiles.",
+                    ));
+                }
+                let epoch = Uuid::new_v4().to_string();
+                self.set_sync_binding(subject, &epoch, "")?;
+                (epoch, String::new())
+            }
+            Some(_) => {
+                return Err(NativeError::new(
+                    NativeErrorCode::AuthRequired,
+                    "Local hosted-sync state belongs to another account. Sign out before switching accounts.",
+                ))
+            }
+            None => {
+                if has_unclaimed_mutations {
+                    return Err(NativeError::new(
+                        NativeErrorCode::SyncAccountClaimRequired,
+                        "Choose whether this account may upload existing local profiles.",
+                    ));
+                }
+                let epoch = Uuid::new_v4().to_string();
+                self.set_sync_binding(subject, &epoch, "")?;
+                (epoch, String::new())
+            }
+        };
+        let mut mutations = Vec::new();
+        for mutation in self
+            .pending_outbox()?
+            .into_iter()
+            .take(HOSTED_SYNC_MUTATION_LIMIT)
+        {
+            let payload: serde_json::Value =
+                serde_json::from_str(&mutation.payload).map_err(internal_error)?;
+            let value = if mutation.kind == "upsert" {
+                json!({
+                    "mutationId": mutation.mutation_id,
+                    "kind": "upsert",
+                    "profile": payload,
+                    "occurredAt": mutation.occurred_at,
+                })
+            } else {
+                json!({
+                    "mutationId": mutation.mutation_id,
+                    "kind": "delete",
+                    "profileId": payload.get("profileId").and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| NativeError::new(NativeErrorCode::Internal, "A local delete mutation is invalid."))?,
+                    "occurredAt": mutation.occurred_at,
+                })
+            };
+            mutations.push(value);
+            let candidate = json!({
+                "deviceId": device_id,
+                "epoch": epoch,
+                "cursor": cursor,
+                "mutations": mutations,
+            });
+            if serde_json::to_vec(&candidate)
+                .map_err(internal_error)?
+                .len()
+                > HOSTED_SYNC_BODY_LIMIT
+            {
+                mutations.pop();
+                if mutations.is_empty() {
+                    return Err(NativeError::new(
+                        NativeErrorCode::Internal,
+                        "A local profile exceeds the hosted sync request limit.",
+                    ));
+                }
+                break;
+            }
+        }
+        let mut request = json!({ "deviceId": device_id, "epoch": epoch, "mutations": mutations });
+        if !cursor.is_empty() {
+            request["cursor"] = serde_json::Value::String(cursor);
+        }
+        Ok(request)
+    }
+
+    pub fn hosted_sync_generation(
+        &self,
+        subject: &str,
+        epoch: &str,
+        cursor: &str,
+    ) -> Result<i64, NativeError> {
+        self.sync_binding()?
+            .filter(|(owner, current_epoch, current_cursor, _)| {
+                owner == subject && current_epoch == epoch && current_cursor == cursor
+            })
+            .map(|(_, _, _, generation)| generation)
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "Hosted sync state changed; retry with the current account session.",
+                )
+            })
+    }
+
+    pub fn apply_hosted_sync_response(
+        &self,
+        expected_subject: &str,
+        expected_epoch: &str,
+        expected_cursor: &str,
+        expected_generation: i64,
+        response: &serde_json::Value,
+    ) -> Result<(), NativeError> {
+        let epoch = response
+            .get("epoch")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "Hosted sync returned an invalid epoch.",
+                )
+            })?;
+        let cursor = response
+            .get("cursor")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "Hosted sync returned an invalid cursor.",
+                )
+            })?;
+        let records = response
+            .get("records")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "Hosted sync returned invalid records.",
+                )
+            })?;
+        let receipts = response
+            .get("receipts")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "Hosted sync returned invalid receipts.",
+                )
+            })?;
+
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        let current: Option<(String, String, String, i64)> = transaction
+            .query_row(
+                "SELECT subject, epoch, cursor, session_generation FROM sync_state WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        if epoch != expected_epoch
+            || current.as_ref()
+                != Some(&(
+                    expected_subject.to_owned(),
+                    expected_epoch.to_owned(),
+                    expected_cursor.to_owned(),
+                    expected_generation,
+                ))
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::Internal,
+                "Hosted sync state changed; the stale response was discarded.",
+            ));
+        }
+        for record in records {
+            match record.get("kind").and_then(serde_json::Value::as_str) {
+                Some("profile") => {
+                    let profile: Profile = serde_json::from_value(
+                        record.get("profile").cloned().ok_or_else(|| {
+                            NativeError::new(
+                                NativeErrorCode::Internal,
+                                "A hosted profile record is missing.",
+                            )
+                        })?,
+                    )
+                    .map_err(internal_error)?;
+                    transaction.execute(
+                        "INSERT INTO profiles(id, name, source_path, target_path, exclusions_json, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                         ON CONFLICT(id) DO UPDATE SET name=excluded.name, source_path=excluded.source_path,
+                         target_path=excluded.target_path, exclusions_json=excluded.exclusions_json, updated_at=excluded.updated_at",
+                        params![profile.id, profile.name, profile.source_path, profile.target_path,
+                            serde_json::to_string(&profile.exclusions).map_err(internal_error)?, profile.created_at, profile.updated_at],
+                    )?;
+                }
+                Some("tombstone") => {
+                    let profile_id = record
+                        .get("profileId")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            NativeError::new(
+                                NativeErrorCode::Internal,
+                                "A hosted tombstone is invalid.",
+                            )
+                        })?;
+                    transaction.execute("DELETE FROM profiles WHERE id = ?1", [profile_id])?;
+                }
+                _ => {
+                    return Err(NativeError::new(
+                        NativeErrorCode::Internal,
+                        "Hosted sync returned an unknown record kind.",
+                    ))
+                }
+            }
+        }
+        for receipt in receipts {
+            let mutation_id = receipt
+                .get("mutationId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::Internal,
+                        "A hosted mutation receipt is invalid.",
+                    )
+                })?;
+            transaction.execute(
+                "DELETE FROM mutation_outbox WHERE mutation_id = ?1",
+                [mutation_id],
+            )?;
+        }
+        let updated = transaction.execute(
+            "UPDATE sync_state SET cursor = ?1
+             WHERE singleton = 1 AND subject = ?2 AND epoch = ?3 AND cursor = ?4 AND session_generation = ?5",
+            params![cursor, expected_subject, expected_epoch, expected_cursor, expected_generation],
+        )?;
+        if updated != 1 {
+            return Err(NativeError::new(
+                NativeErrorCode::Internal,
+                "Hosted sync state changed; the stale response was discarded.",
+            ));
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn record_run(
@@ -939,18 +1450,342 @@ fn delete_profile(id: String, database: State<'_, Database>) -> Result<(), Nativ
     database.delete_profile(&id)
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HostedSyncOutcome {
+    acknowledged: usize,
+    records_applied: usize,
+    cursor: String,
+}
+
+#[derive(Default)]
+struct HostedSyncLock(tokio::sync::Mutex<()>);
+
+#[tauri::command]
+async fn sync_hosted_profiles(
+    api_url: String,
+    access_token: String,
+    subject: String,
+    database: State<'_, Database>,
+    sync_lock: State<'_, HostedSyncLock>,
+) -> Result<HostedSyncOutcome, NativeError> {
+    let _sync_guard = sync_lock.0.lock().await;
+    let base = url::Url::parse(&api_url).map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::Internal,
+            "Hosted sync configuration is invalid.",
+        )
+    })?;
+    if base.scheme() != "https" || base.host_str().is_none() {
+        return Err(NativeError::new(
+            NativeErrorCode::Internal,
+            "Hosted sync requires an HTTPS endpoint.",
+        ));
+    }
+    let endpoint = base.join("/v1/sync").map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::Internal,
+            "Hosted sync configuration is invalid.",
+        )
+    })?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "Hosted sync is unavailable; local data remains safe.",
+            )
+        })?;
+    let mut acknowledged = 0;
+    let mut records_applied = 0;
+    let cursor = loop {
+        let payload = database.hosted_sync_request(&subject)?;
+        let expected_epoch = payload["epoch"].as_str().unwrap_or_default().to_owned();
+        let expected_cursor = payload["cursor"].as_str().unwrap_or_default().to_owned();
+        let expected_generation =
+            database.hosted_sync_generation(&subject, &expected_epoch, &expected_cursor)?;
+        let sent_ids: HashSet<String> = payload["mutations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|mutation| mutation["mutationId"].as_str().map(ToOwned::to_owned))
+            .collect();
+        let mut response = client
+            .post(endpoint.clone())
+            .bearer_auth(&access_token)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "Hosted sync is unavailable; local data remains safe.",
+                )
+            })?;
+        let status = response.status();
+        if response
+            .content_length()
+            .is_some_and(|length| length > 2 * 1024 * 1024)
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::Internal,
+                "Hosted sync returned an oversized response.",
+            ));
+        }
+        let mut response_bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "Hosted sync returned an invalid response.",
+            )
+        })? {
+            if response_bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+                return Err(NativeError::new(
+                    NativeErrorCode::Internal,
+                    "Hosted sync returned an oversized response.",
+                ));
+            }
+            response_bytes.extend_from_slice(&chunk);
+        }
+        let body: serde_json::Value = serde_json::from_slice(&response_bytes).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "Hosted sync returned an invalid response.",
+            )
+        })?;
+        if status == reqwest::StatusCode::CONFLICT
+            && body.get("code").and_then(serde_json::Value::as_str)
+                == Some("SYNC_EPOCH_RESET_REQUIRED")
+        {
+            return Err(NativeError {
+                code: NativeErrorCode::SyncEpochResetRequired,
+                message:
+                    "Hosted profile data was reset. Review this device before uploading again."
+                        .into(),
+                details: body
+                    .get("epoch")
+                    .cloned()
+                    .map(|epoch| json!({ "epoch": epoch })),
+            });
+        }
+        if !status.is_success() {
+            return Err(NativeError::new(
+                if status == reqwest::StatusCode::UNAUTHORIZED {
+                    NativeErrorCode::AuthRequired
+                } else {
+                    NativeErrorCode::Internal
+                },
+                "Hosted sync was rejected; local data remains safe.",
+            ));
+        }
+        acknowledged += body
+            .get("receipts")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        records_applied += body
+            .get("records")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        let response_cursor = body
+            .get("cursor")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        database.apply_hosted_sync_response(
+            &subject,
+            &expected_epoch,
+            &expected_cursor,
+            expected_generation,
+            &body,
+        )?;
+        let has_more = body
+            .get("hasMore")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        if sent_ids.is_empty() {
+            if has_more {
+                continue;
+            }
+            break response_cursor;
+        }
+        let pending: HashSet<String> = database
+            .pending_outbox()?
+            .into_iter()
+            .map(|mutation| mutation.mutation_id)
+            .collect();
+        if sent_ids.iter().any(|id| pending.contains(id)) {
+            return Err(NativeError::new(
+                NativeErrorCode::Internal,
+                "Hosted sync returned incomplete mutation receipts; local data remains queued.",
+            ));
+        }
+        if pending.is_empty() && !has_more {
+            break response_cursor;
+        }
+    };
+    Ok(HostedSyncOutcome {
+        acknowledged,
+        records_applied,
+        cursor,
+    })
+}
+
+#[tauri::command]
+fn clear_local_synced_data(database: State<'_, Database>) -> Result<(), NativeError> {
+    database.clear_local_synced_data()
+}
+
+#[tauri::command]
+fn disconnect_hosted_account(
+    remove_local_profiles: bool,
+    database: State<'_, Database>,
+) -> Result<(), NativeError> {
+    database.disconnect_hosted_account(remove_local_profiles)
+}
+
+#[tauri::command]
+fn claim_hosted_account(
+    subject: String,
+    upload_existing: bool,
+    database: State<'_, Database>,
+) -> Result<(), NativeError> {
+    database.claim_hosted_account(&subject, upload_existing)
+}
+
+#[tauri::command]
+fn accept_hosted_epoch(
+    subject: String,
+    epoch: String,
+    remove_local_profiles: bool,
+    database: State<'_, Database>,
+) -> Result<(), NativeError> {
+    if subject.is_empty() || Uuid::parse_str(&epoch).is_err() {
+        return Err(NativeError::new(
+            NativeErrorCode::SyncEpochResetRequired,
+            "Hosted sync returned an invalid account reset.",
+        ));
+    }
+    database.accept_account_epoch(&subject, &epoch, remove_local_profiles)
+}
+
+#[tauri::command]
+async fn delete_hosted_account_data(
+    api_url: String,
+    access_token: String,
+    subject: String,
+    remove_local_profiles: bool,
+    database: State<'_, Database>,
+    sync_lock: State<'_, HostedSyncLock>,
+) -> Result<(), NativeError> {
+    let _sync_guard = sync_lock.0.lock().await;
+    let base = url::Url::parse(&api_url).map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::Internal,
+            "Hosted sync configuration is invalid.",
+        )
+    })?;
+    if base.scheme() != "https" || base.host_str().is_none() {
+        return Err(NativeError::new(
+            NativeErrorCode::Internal,
+            "Hosted sync requires an HTTPS endpoint.",
+        ));
+    }
+    let request = database.hosted_sync_request(&subject)?;
+    let epoch = request["epoch"].as_str().unwrap_or_default().to_owned();
+    let cursor = request["cursor"].as_str().unwrap_or_default().to_owned();
+    let generation = database.hosted_sync_generation(&subject, &epoch, &cursor)?;
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "Hosted account deletion is unavailable.",
+            )
+        })?
+        .delete(base.join("/v1/account-data").map_err(internal_error)?)
+        .bearer_auth(access_token)
+        .json(&json!({ "epoch": epoch }))
+        .send()
+        .await
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "Hosted account deletion is unavailable.",
+            )
+        })?;
+    if !response.status().is_success() {
+        return Err(NativeError::new(
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                NativeErrorCode::AuthRequired
+            } else {
+                NativeErrorCode::Internal
+            },
+            "Hosted account deletion was rejected; local data was not changed.",
+        ));
+    }
+    let body: serde_json::Value = response.json().await.map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::Internal,
+            "Hosted account deletion returned an invalid response.",
+        )
+    })?;
+    let next_epoch = body
+        .get("epoch")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "Hosted account deletion returned an invalid epoch.",
+            )
+        })?;
+    if Uuid::parse_str(next_epoch).is_err() {
+        return Err(NativeError::new(
+            NativeErrorCode::Internal,
+            "Hosted account deletion returned an invalid epoch.",
+        ));
+    }
+    database.accept_account_epoch_if_current(
+        &subject,
+        &epoch,
+        &cursor,
+        generation,
+        next_epoch,
+        remove_local_profiles,
+    )
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if let Some(url) = strict_auth_callback_arg(&args) {
+                let _ = app.emit("rootline-auth-deep-link", url);
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_focus();
+                }
+            }
+        }))
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let directory = app.path().app_data_dir()?;
             fs::create_dir_all(&directory)?;
+            app.handle().plugin(
+                tauri_plugin_stronghold::Builder::with_argon2(
+                    &directory.join("rootline-auth.salt"),
+                )
+                .build(),
+            )?;
             let database = Database::open(directory.join("rootline.sqlite3"))
                 .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
             database
                 .device_id()
                 .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
             app.manage(database);
+            app.manage(HostedSyncLock::default());
             app.manage(Arc::new(OperationRegistry::default()));
             Ok(())
         })
@@ -962,6 +1797,13 @@ pub fn run() {
             list_profiles,
             save_profile,
             delete_profile,
+            auth_vault_password,
+            sync_hosted_profiles,
+            clear_local_synced_data,
+            disconnect_hosted_account,
+            claim_hosted_account,
+            accept_hosted_epoch,
+            delete_hosted_account_data,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Rootline");
