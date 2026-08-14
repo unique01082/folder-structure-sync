@@ -1,0 +1,12 @@
+{
+  "name": "@rootline/core",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Rootline environment-independent synchronization core",
+  "license": "ISC",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}

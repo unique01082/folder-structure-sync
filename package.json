@@ -1,70 +1,20 @@
 {
-  "name": "folder-structure-sync",
-  "version": "1.0.0",
-  "description": "🚀 Interactive CLI tool for syncing folder structures with smart selection, dependency handling, and beautiful output",
-  "main": "index.js",
-  "bin": {
-    "folder-sync": "index.js"
-  },
-  "scripts": {
-    "start": "node index.js",
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "demo": "node index.js --help",
-    "precheck": "node scripts/pre-publish-check.js",
-    "test-package": "node scripts/test-package.js",
-    "release:patch": "node scripts/release.js patch",
-    "release:minor": "node scripts/release.js minor",
-    "release:major": "node scripts/release.js major",
-    "publish:check": "npm run precheck && npm run test-package",
-    "publish:safe": "npm run publish:check && npm publish",
-    "workflow:stats": "node scripts/workflow.js stats",
-    "workflow:social": "node scripts/workflow.js social",
-    "workflow:promotion": "node scripts/workflow.js promotion",
-    "workflow:commands": "node scripts/workflow.js commands"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/unique01082/folder-structure-sync.git"
-  },
-  "keywords": [
-    "folder",
-    "sync",
-    "directory",
-    "structure",
-    "cli",
-    "interactive",
-    "template",
-    "project-setup",
-    "development",
-    "automation",
-    "filesystem",
-    "folders",
-    "organize"
-  ],
-  "author": {
-    "name": "Bao LE",
-    "email": "bao.lq.it@gmail.com",
-    "url": "https://github.com/unique01082"
-  },
+  "name": "rootline-workspace",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Rootline by baole.space workspace orchestration",
   "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/unique01082/folder-structure-sync/issues"
-  },
-  "homepage": "https://github.com/unique01082/folder-structure-sync#readme",
   "engines": {
-    "node": ">=12.0.0"
+    "node": ">=20.0.0"
   },
-  "files": [
-    "index.js",
-    "sync-config.json",
-    "README.md",
-    "LICENSE",
-    "CHANGELOG.md"
-  ],
-  "dependencies": {
-    "chalk": "^4.1.2",
-    "cli-progress": "^3.12.0",
-    "commander": "^14.0.0",
-    "inquirer": "^8.2.6"
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "build": "pnpm -r --if-present run build",
+    "test": "pnpm --filter @rootline/contracts test",
+    "typecheck": "pnpm -r --if-present run typecheck"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   }
 }

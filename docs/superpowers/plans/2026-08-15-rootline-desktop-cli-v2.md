@@ -53,3 +53,8 @@ Acceptance: API tests with real PostgreSQL cover invalid issuer/audience, cross-
 Add CI for lint/typecheck/tests/builds, Rust fmt/clippy/test, npm tarball smoke and Tauri macOS/Windows build matrices. Add fail-closed release workflows for npm, API image/migration health, signed/notarized installers and signed updater manifests. Update README, security/privacy, architecture, configuration/migration and operations documentation. Add a Rootline product/download entry to the sibling `baole.space` portal using its existing catalog pattern without modifying unrelated portal work.
 
 Acceptance: all local gates pass; release workflow validation passes without publishing; missing signing/auth/deployment secrets block stable jobs with actionable messages; final branch review has no Critical/Important findings. External credentials and live provider/signing operations are reported as explicit blocked gates, not claimed complete.
+
+## Related
+
+- [Rootline documentation](../../README.md) - Documentation navigation.
+- [npm `folder-structure-sync@1.1.0` recovery](../../baseline/npm-1.1.0-recovery.md) - The published baseline retained for migration.
