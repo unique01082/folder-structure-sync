@@ -54,6 +54,7 @@ export function App({ gateway = tauriGateway, initialProfile }: AppProps): React
   const [activeOperation, setActiveOperation] = useState<string>();
   const headingRef = useRef<HTMLHeadingElement>(null);
   const scanButtonRef = useRef<HTMLButtonElement>(null);
+  const returnToScanRef = useRef(false);
   const profileNameId = useId();
 
   useEffect(() => {
@@ -68,15 +69,24 @@ export function App({ gateway = tauriGateway, initialProfile }: AppProps): React
   }, [gateway, initialProfile]);
 
   useEffect(() => {
-    if (step !== "choose") headingRef.current?.focus();
+    if (step === "choose" && returnToScanRef.current) {
+      returnToScanRef.current = false;
+      scanButtonRef.current?.focus();
+    } else {
+      headingRef.current?.focus();
+    }
   }, [step]);
+
+  useEffect(() => {
+    document.documentElement.lang = locale;
+  }, [locale]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
       if (event.key !== "Escape" || (step !== "review" && step !== "result")) return;
       event.preventDefault();
+      returnToScanRef.current = true;
       setStep("choose");
-      setTimeout(() => scanButtonRef.current?.focus(), 0);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -113,6 +123,7 @@ export function App({ gateway = tauriGateway, initialProfile }: AppProps): React
     } catch (unknownError) {
       const failure = nativeFailure(unknownError);
       if (failure.code === "CANCELLED") {
+        returnToScanRef.current = true;
         setStep("choose");
       } else if (failure.code === "SOURCE_NOT_FOUND") {
         setRebind("source");
@@ -148,7 +159,13 @@ export function App({ gateway = tauriGateway, initialProfile }: AppProps): React
       setStep("result");
     } catch (unknownError) {
       const failure = nativeFailure(unknownError);
-      setError(failure.code === "STALE_PLAN" ? failure.message : text.genericError);
+      setError(
+        failure.code === "STALE_PLAN" ? text.stalePlan
+          : failure.code === "SOURCE_NOT_FOUND" ? text.sourceMissing
+            : failure.code === "TARGET_NOT_FOUND" ? text.targetMissing
+              : failure.code === "CANCELLED" ? text.operationCancelled
+                : text.genericError,
+      );
       setStep("review");
     } finally {
       setActiveOperation(undefined);
@@ -245,7 +262,7 @@ export function App({ gateway = tauriGateway, initialProfile }: AppProps): React
 
       <main className="workbench">
         <header className="topbar">
-          <nav aria-label="Workflow progress">
+          <nav aria-label={text.workflowProgress}>
             <ol className="steps">
               {text.steps.map((label, index) => (
                 <li key={label} aria-current={currentStep === index ? "step" : undefined} className={currentStep >= index ? "reached" : ""}>
@@ -260,8 +277,8 @@ export function App({ gateway = tauriGateway, initialProfile }: AppProps): React
         <div className="workspace">
           {step === "choose" ? (
             <section className="stage choose-stage" aria-labelledby="choose-title">
-              <p className="eyebrow">STRUCTURE / ADDITIVE</p>
-              <h1 id="choose-title" ref={headingRef}>{text.chooseTitle}</h1>
+              <p className="eyebrow">{text.chooseEyebrow}</p>
+              <h1 id="choose-title" ref={headingRef} tabIndex={-1}>{text.chooseTitle}</h1>
               <p className="lede">{text.chooseBody}</p>
               {error ? <div className="error-card" role="alert"><span aria-hidden="true">!</span><p>{error}</p></div> : null}
               <div className="root-pair">
@@ -290,7 +307,7 @@ export function App({ gateway = tauriGateway, initialProfile }: AppProps): React
                 <div className="scan-trunk"><i /><i /><i /><i /></div>
                 <div className="scan-line" />
               </div>
-              <h1 id="progress-title" ref={headingRef}>{step === "scanning" ? text.scanning : text.applying}</h1>
+              <h1 id="progress-title" ref={headingRef} tabIndex={-1}>{step === "scanning" ? text.scanning : text.applying}</h1>
               <div role="status" className="progress-status">{step === "scanning" ? text.scanning : text.applying}</div>
               <button className="secondary-button" type="button" onClick={() => void cancel()}>{text.cancel}</button>
             </section>
@@ -298,7 +315,7 @@ export function App({ gateway = tauriGateway, initialProfile }: AppProps): React
 
           {step === "review" && plan ? (
             <section className="stage review-stage" aria-labelledby="review-title">
-              <p className="eyebrow">DIFF / {plan.targetCaseSensitive ? "CASE-SENSITIVE" : "CASE-INSENSITIVE"}</p>
+              <p className="eyebrow">{text.reviewEyebrow(plan.targetCaseSensitive)}</p>
               <h1 id="review-title" ref={headingRef} tabIndex={-1}>{text.review(plan.missing.length)}</h1>
               <p className="lede">{text.reviewBody}</p>
               {error ? <div className="error-card" role="alert"><span aria-hidden="true">!</span><p>{error}</p></div> : null}
@@ -310,7 +327,7 @@ export function App({ gateway = tauriGateway, initialProfile }: AppProps): React
                   entries={plan.missing}
                   selected={selected}
                   onSelectionChange={setSelected}
-                  labels={{ search: text.search, all: text.all, selected: text.selected, clear: text.clear, selectAll: text.selectAll, expand: text.expand, collapse: text.collapse }}
+                  labels={text.tree}
                 />
               )}
               <div className="review-actions">
@@ -322,15 +339,25 @@ export function App({ gateway = tauriGateway, initialProfile }: AppProps): React
 
           {step === "result" && result ? (
             <section className="stage result-stage" aria-labelledby="result-title">
-              <div className="result-mark" aria-hidden="true">✓</div>
-              <p className="eyebrow">RUN / COMPLETE</p>
-              <h1 id="result-title" ref={headingRef} tabIndex={-1}>{text.result(createdCount)}</h1>
-              <p className="lede">{text.resultBody}</p>
+              <div className={result.cancelled ? "result-mark cancelled" : "result-mark"} aria-hidden="true">{result.cancelled ? "‖" : "✓"}</div>
+              <p className="eyebrow">{text.resultEyebrow}</p>
+              <h1 id="result-title" ref={headingRef} tabIndex={-1}>{result.cancelled ? text.cancelledResult(createdCount) : text.result(createdCount)}</h1>
+              <p className="lede">{result.cancelled ? text.cancelledBody : text.resultBody}</p>
               <div className="result-summary">
                 <div><strong>{createdCount}</strong><span>{text.created}</span></div>
-                <div><strong>{result.directories.filter((entry) => entry.status === "already-exists").length}</strong><span>{text.unchanged}</span></div>
+                <div><strong>{result.directories.filter((entry) => entry.status === "already-exists").length}</strong><span>{text.alreadyExists}</span></div>
                 <div><strong>{result.directories.filter((entry) => entry.status === "failed").length}</strong><span>{text.failed}</span></div>
               </div>
+              <ul className="result-details">
+                {result.directories.map((entry) => (
+                  <li className={`status-${entry.status}`} key={entry.relativePath}>
+                    <span className="result-path">{entry.relativePath}</span>
+                    <span className="result-status">{entry.status === "created" ? text.created : entry.status === "already-exists" ? text.alreadyExists : text.failed}</span>
+                    {entry.error ? <small>{entry.error}</small> : null}
+                  </li>
+                ))}
+              </ul>
+              {result.directories.some((entry) => entry.status === "failed") ? <p className="failure-action">{text.failureAction}</p> : null}
               <div className="review-actions">
                 <button className="secondary-button" type="button" onClick={() => { setPlan(undefined); setResult(undefined); setStep("choose"); }}>{text.newPair}</button>
                 <button className="primary-button" type="button" onClick={() => void scan()}>{text.again}<span aria-hidden="true">↗</span></button>

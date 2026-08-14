@@ -9,6 +9,8 @@ import type { NativeGateway, ScanPlan } from "../native";
 
 const plan: ScanPlan = {
   operationId: "scan-1",
+  sourceRoot: "/projects/source",
+  targetRoot: "/projects/target",
   sourceFingerprint: "source-fp",
   targetFingerprint: "target-fp",
   targetCaseSensitive: false,
@@ -25,6 +27,7 @@ function gateway(overrides: Partial<NativeGateway> = {}): NativeGateway {
       runId: "run-1",
       startedAt: "2026-08-15T00:00:00Z",
       finishedAt: "2026-08-15T00:00:01Z",
+      cancelled: false,
       directories: [
         { relativePath: "docs", status: "created" as const },
         { relativePath: "docs/api", status: "created" as const },
@@ -52,12 +55,14 @@ describe("Rootline desktop workflow", () => {
     await user.click(screen.getByRole("button", { name: "Scan differences" }));
     const reviewHeading = await screen.findByRole("heading", { name: "Review 4 missing folders" });
     expect(reviewHeading).toHaveFocus();
-    await user.click(screen.getByRole("checkbox", { name: "docs/api" }));
+    await user.click(screen.getByRole("button", { name: "Clear selection" }));
+    await user.click(screen.getByRole("treeitem", { name: "docs/api" }));
+    expect(screen.getByRole("button", { name: "Create selected folders" })).toHaveTextContent("2");
     await user.click(screen.getByRole("button", { name: "Create selected folders" }));
 
     const resultHeading = await screen.findByRole("heading", { name: "2 folders created" });
     expect(resultHeading).toHaveFocus();
-    expect(native.apply).toHaveBeenCalledWith(expect.objectContaining({ selected: ["docs", "src", "src/components"] }));
+    expect(native.apply).toHaveBeenCalledWith(expect.objectContaining({ selected: ["docs", "docs/api"] }));
     await user.keyboard("{Escape}");
     await waitFor(() => expect(screen.getByRole("button", { name: "Scan differences" })).toHaveFocus());
   });
@@ -100,16 +105,90 @@ describe("Rootline desktop workflow", () => {
     await user.keyboard("{ArrowDown}{Enter}");
     expect(screen.getByText("/two")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Tiếng Việt" }));
+    expect(document.documentElement.lang).toBe("vi");
     expect(screen.getByRole("heading", { name: "Chọn hai thư mục gốc" })).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Quét khác biệt" }));
     await user.click(await screen.findByRole("button", { name: "Tạo các thư mục đã chọn" }));
-    expect(await screen.findByText("đã tạo")).toBeInTheDocument();
-    expect(screen.getByText("không đổi")).toBeInTheDocument();
+    expect((await screen.findAllByText("đã tạo")).length).toBeGreaterThan(0);
+    expect(screen.getByText("đã tồn tại")).toBeInTheDocument();
     expect(screen.getByText("thất bại")).toBeInTheDocument();
 
     const results = await axe.run(container);
     expect(results.violations.filter((violation) => violation.impact === "critical" || violation.impact === "serious")).toEqual([]);
+  });
+
+  test("focuses progress and choose transitions and localizes native stale errors", async () => {
+    const user = userEvent.setup();
+    let rejectScan: ((reason: unknown) => void) | undefined;
+    const scanPending = new Promise<ScanPlan>((_resolve, reject) => { rejectScan = reject; });
+    const native = gateway({
+      scan: vi.fn(() => scanPending),
+      cancel: vi.fn(async () => rejectScan?.({ code: "CANCELLED", message: "raw cancelled" })),
+    });
+    const first = render(<App gateway={native} initialProfile={{
+      id: "p", name: "Pair", sourcePath: "/projects/source", targetPath: "/projects/target",
+      exclusions: [], createdAt: "x", updatedAt: "x",
+    }} />);
+    await user.click(screen.getByRole("button", { name: "Scan differences" }));
+    expect(screen.getByRole("heading", { name: "Tracing folder structure…" })).toHaveFocus();
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Scan differences" })).toHaveFocus());
+    expect(document.body).not.toHaveFocus();
+    first.unmount();
+
+    const stale = gateway({ apply: vi.fn(async () => { throw { code: "STALE_PLAN", message: "raw Rust stale" }; }) });
+    const view = render(<App gateway={stale} initialProfile={{
+      id: "p", name: "Pair", sourcePath: "/projects/source", targetPath: "/projects/target",
+      exclusions: [], createdAt: "x", updatedAt: "x",
+    }} />);
+    await user.click(screen.getByRole("button", { name: "Tiếng Việt" }));
+    await user.click(screen.getByRole("button", { name: "Quét khác biệt" }));
+    await user.click(await screen.findByRole("button", { name: "Tạo các thư mục đã chọn" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Thư mục đã thay đổi");
+    expect(screen.queryByText("raw Rust stale")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Chọn cặp khác" }));
+    expect(screen.getByRole("heading", { name: "Chọn hai thư mục gốc" })).toHaveFocus();
+    view.unmount();
+  });
+
+  test("renders localized per-path results, failure details, and cancelled runs", async () => {
+    const user = userEvent.setup();
+    const native = gateway({
+      apply: vi.fn(async () => ({
+        runId: "partial", startedAt: "x", finishedAt: "y", cancelled: true,
+        directories: [
+          { relativePath: "docs", status: "created" as const },
+          { relativePath: "existing", status: "already-exists" as const },
+          { relativePath: "blocked", status: "failed" as const, error: "Permission denied" },
+        ],
+      })),
+    });
+    render(<App gateway={native} initialProfile={{
+      id: "p", name: "Pair", sourcePath: "/projects/source", targetPath: "/projects/target",
+      exclusions: [], createdAt: "x", updatedAt: "x",
+    }} />);
+    await user.click(screen.getByRole("button", { name: "Tiếng Việt" }));
+    await user.click(screen.getByRole("button", { name: "Quét khác biệt" }));
+    await user.click(await screen.findByRole("button", { name: "Tạo các thư mục đã chọn" }));
+    expect(await screen.findByRole("heading", { name: "Đã hủy sau khi tạo 1 thư mục" })).toBeInTheDocument();
+    expect(screen.getByText("docs").closest("li")).toHaveTextContent("đã tạo");
+    expect(screen.getByText("existing").closest("li")).toHaveTextContent("đã tồn tại");
+    expect(screen.getByText("blocked").closest("li")).toHaveTextContent("thất bại");
+    expect(screen.getByText("Permission denied")).toBeInTheDocument();
+    expect(screen.getByText("Kiểm tra quyền truy cập rồi chạy lại.")).toBeInTheDocument();
+  });
+
+  test("has zero axe violations while Review is mounted", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<App gateway={gateway()} initialProfile={{
+      id: "p", name: "Pair", sourcePath: "/projects/source", targetPath: "/projects/target",
+      exclusions: [], createdAt: "x", updatedAt: "x",
+    }} />);
+    await user.click(screen.getByRole("button", { name: "Scan differences" }));
+    await screen.findByRole("heading", { name: "Review 4 missing folders" });
+    const results = await axe.run(container);
+    expect(results.violations).toEqual([]);
   });
 });
 
@@ -122,11 +201,34 @@ describe("DiffTree virtualization", () => {
       <DiffTree entries={entries} selected={new Set(entries)} onSelectionChange={onSelectionChange} />,
     );
 
-    expect(screen.getByRole("tree")).toHaveAttribute("aria-rowcount", "50000");
+    expect(screen.getByRole("tree")).not.toHaveAttribute("aria-rowcount");
     expect(container.querySelectorAll('[role="treeitem"]').length).toBeLessThan(80);
     await user.type(screen.getByRole("searchbox", { name: "Search folders" }), "folder-49999");
-    expect(await screen.findByRole("checkbox", { name: entries[49_999]! })).toBeInTheDocument();
+    expect(await screen.findByRole("treeitem", { name: entries[49_999]! })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Clear selection" }));
     expect(onSelectionChange).toHaveBeenLastCalledWith(new Set());
+  });
+
+  test("uses named treeitems with roving keyboard navigation and parent dependency selection", async () => {
+    const user = userEvent.setup();
+    const entries = ["docs", "docs/api", "docs/api/v2", "src"];
+    const onSelectionChange = vi.fn();
+    const view = render(<DiffTree entries={entries} selected={new Set()} onSelectionChange={onSelectionChange} />);
+    const docs = screen.getByRole("treeitem", { name: "docs" });
+    const api = screen.getByRole("treeitem", { name: "docs/api" });
+    expect(screen.getByRole("tree")).not.toHaveAttribute("aria-rowcount");
+    expect(docs).toHaveAttribute("tabindex", "0");
+    expect(view.container.querySelector('[role="treeitem"] button, [role="treeitem"] input')).toBeNull();
+    docs.focus();
+    await user.keyboard("{ArrowDown}");
+    expect(api).toHaveFocus();
+    await user.keyboard(" ");
+    expect(onSelectionChange).toHaveBeenLastCalledWith(new Set(["docs", "docs/api", "docs/api/v2"]));
+    await user.keyboard("{ArrowLeft}");
+    expect(api).toHaveFocus();
+    await user.keyboard("{ArrowLeft}");
+    expect(docs).toHaveFocus();
+    await user.keyboard("{End}");
+    expect(screen.getByRole("treeitem", { name: "src" })).toHaveFocus();
   });
 });

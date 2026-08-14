@@ -1,7 +1,8 @@
 use std::fs;
 
 use rootline_desktop::{
-    apply_plan, scan_plan, CancellationToken, Database, NativeErrorCode, Profile, ScanRequest,
+    apply_plan, detect_case_sensitive, scan_plan, CancellationToken, Database, DirectoryStatus,
+    NativeErrorCode, Profile, ScanRequest,
 };
 use tempfile::tempdir;
 
@@ -48,6 +49,92 @@ fn scans_additively_and_revalidates_before_mkdir() {
 }
 
 #[test]
+fn binds_a_plan_to_its_canonical_roots_even_when_snapshots_match() {
+    let source = tempdir().unwrap();
+    let target = tempdir().unwrap();
+    let other_source = tempdir().unwrap();
+    let other_target = tempdir().unwrap();
+    fs::create_dir(source.path().join("docs")).unwrap();
+    fs::create_dir(other_source.path().join("docs")).unwrap();
+
+    let plan = scan_plan(
+        &request(source.path(), target.path()),
+        &CancellationToken::default(),
+    )
+    .unwrap();
+    assert_eq!(plan.source_root, fs::canonicalize(source.path()).unwrap());
+    assert_eq!(plan.target_root, fs::canonicalize(target.path()).unwrap());
+
+    let error = apply_plan(
+        &request(other_source.path(), other_target.path()),
+        &plan,
+        &plan.missing,
+        &CancellationToken::default(),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, NativeErrorCode::StalePlan);
+    assert!(!other_target.path().join("docs").exists());
+}
+
+#[test]
+fn reports_case_semantics_and_failed_directory_creation() {
+    let case_root = tempdir().unwrap();
+    let case_sensitive = detect_case_sensitive(case_root.path()).unwrap();
+    fs::write(case_root.path().join("CaseProbe"), b"x").unwrap();
+    assert_eq!(case_root.path().join("caseprobe").exists(), !case_sensitive);
+
+    let source = tempdir().unwrap();
+    let target = tempdir().unwrap();
+    fs::create_dir(source.path().join("blocked")).unwrap();
+    fs::write(target.path().join("blocked"), b"not a directory").unwrap();
+    let plan = scan_plan(
+        &request(source.path(), target.path()),
+        &CancellationToken::default(),
+    )
+    .unwrap();
+    let result = apply_plan(
+        &request(source.path(), target.path()),
+        &plan,
+        &["blocked".into()],
+        &CancellationToken::default(),
+    )
+    .unwrap();
+    assert_eq!(result.directories[0].status, DirectoryStatus::Failed);
+    assert!(result.directories[0].error.is_some());
+}
+
+#[test]
+fn returns_accumulated_results_when_cancelled_during_mkdir() {
+    let source = tempdir().unwrap();
+    let target = tempdir().unwrap();
+    for index in 0..2_000 {
+        fs::create_dir(source.path().join(format!("folder-{index:04}"))).unwrap();
+    }
+    let scan_request = request(source.path(), target.path());
+    let plan = scan_plan(&scan_request, &CancellationToken::default()).unwrap();
+    let token = CancellationToken::default();
+    let worker_token = token.clone();
+    let selected = plan.missing.clone();
+    let worker =
+        std::thread::spawn(move || apply_plan(&scan_request, &plan, &selected, &worker_token));
+    for _ in 0..10_000 {
+        if fs::read_dir(target.path()).unwrap().any(|entry| {
+            entry
+                .and_then(|value| value.file_type())
+                .is_ok_and(|file_type| file_type.is_dir())
+        }) {
+            token.cancel();
+            break;
+        }
+        std::thread::yield_now();
+    }
+    let result = worker.join().unwrap().unwrap();
+    assert!(result.cancelled);
+    assert!(!result.directories.is_empty());
+    assert!(result.directories.len() < 2_000);
+}
+
+#[test]
 fn rejects_overlapping_roots_and_honors_cancellation() {
     let source = tempdir().unwrap();
     fs::create_dir(source.path().join("child")).unwrap();
@@ -88,6 +175,18 @@ fn skips_symbolic_links_instead_of_following_them() {
     .unwrap();
     assert!(plan.missing.is_empty());
     assert_eq!(plan.skipped_links, ["linked"]);
+
+    let linked_root = source.path().join("linked-root");
+    symlink(outside.path(), &linked_root).unwrap();
+    assert_eq!(
+        scan_plan(
+            &request(&linked_root, target.path()),
+            &CancellationToken::default(),
+        )
+        .unwrap_err()
+        .code,
+        NativeErrorCode::InvalidPath,
+    );
 }
 
 #[test]

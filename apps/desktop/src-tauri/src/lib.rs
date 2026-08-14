@@ -84,6 +84,10 @@ impl CancellationToken {
             Ok(())
         }
     }
+
+    fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Default)]
@@ -144,6 +148,8 @@ pub struct DirectoryResult {
 #[serde(rename_all = "camelCase")]
 pub struct ScanPlan {
     pub operation_id: String,
+    pub source_root: PathBuf,
+    pub target_root: PathBuf,
     pub source_fingerprint: String,
     pub target_fingerprint: String,
     pub target_case_sensitive: bool,
@@ -159,6 +165,7 @@ pub struct ApplyResult {
     pub started_at: String,
     pub finished_at: String,
     pub directories: Vec<DirectoryResult>,
+    pub cancelled: bool,
 }
 
 #[derive(Debug)]
@@ -205,7 +212,7 @@ fn canonical_directory(path: &Path, role: &str) -> Result<PathBuf, NativeError> 
 fn assert_not_link(path: &Path) -> Result<(), NativeError> {
     let absolute = absolute(path)?;
     match fs::symlink_metadata(&absolute) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(NativeError::at(
+        Ok(metadata) if is_link_or_junction(&metadata) => Err(NativeError::at(
             NativeErrorCode::InvalidPath,
             "A synchronization root must not be a symbolic link or junction.",
             &absolute,
@@ -218,6 +225,20 @@ fn assert_not_link(path: &Path) -> Result<(), NativeError> {
             &absolute,
         )),
     }
+}
+
+#[cfg(not(windows))]
+fn is_link_or_junction(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn is_link_or_junction(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 fn assert_no_link_below(root: &Path, destination: &Path) -> Result<(), NativeError> {
@@ -376,7 +397,7 @@ fn scan_root(
             let metadata = fs::symlink_metadata(&path).map_err(|error| {
                 NativeError::at(NativeErrorCode::UnreadablePath, error.to_string(), &path)
             })?;
-            if metadata.file_type().is_symlink() {
+            if is_link_or_junction(&metadata) {
                 skipped_links.push(relative);
             } else if metadata.is_dir() {
                 entries.push(relative);
@@ -424,6 +445,8 @@ pub fn scan_plan(
         .cloned()
         .collect();
     let mut plan_values = vec![
+        source.to_string_lossy().into_owned(),
+        target.to_string_lossy().into_owned(),
         source_snapshot.fingerprint.clone(),
         target_snapshot.fingerprint.clone(),
         if target_case_sensitive {
@@ -435,6 +458,8 @@ pub fn scan_plan(
     plan_values.extend(missing.iter().cloned());
     Ok(ScanPlan {
         operation_id: request.operation_id.clone(),
+        source_root: source,
+        target_root: target,
         source_fingerprint: source_snapshot.fingerprint,
         target_fingerprint: target_snapshot.fingerprint,
         target_case_sensitive,
@@ -476,6 +501,14 @@ pub fn apply_plan(
     token: &CancellationToken,
 ) -> Result<ApplyResult, NativeError> {
     let started_at = timestamp();
+    let source = canonical_directory(&request.source_path, "source")?;
+    let target = canonical_directory(&request.target_path, "target")?;
+    if source != plan.source_root || target != plan.target_root {
+        return Err(NativeError::new(
+            NativeErrorCode::StalePlan,
+            "The selected roots differ from the reviewed plan.",
+        ));
+    }
     let current = scan_plan(request, token)?;
     if current.source_fingerprint != plan.source_fingerprint
         || current.target_fingerprint != plan.target_fingerprint
@@ -487,10 +520,11 @@ pub fn apply_plan(
             "The folders changed after review. Scan again before applying.",
         ));
     }
-    let target = canonical_directory(&request.target_path, "target")?;
     let mut directories = Vec::new();
     for relative in selected_with_parents(plan, selected) {
-        token.check()?;
+        if token.is_cancelled() {
+            break;
+        }
         if relative
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")
@@ -504,35 +538,37 @@ pub fn apply_plan(
             .split('/')
             .fold(target.clone(), |path, part| path.join(part));
         assert_no_link_below(&target, &destination)?;
-        let entry = match fs::create_dir(&destination) {
-            Ok(()) => DirectoryResult {
-                relative_path: relative,
-                status: DirectoryStatus::Created,
-                error: None,
-            },
-            Err(error)
-                if error.kind() == std::io::ErrorKind::AlreadyExists && destination.is_dir() =>
-            {
-                DirectoryResult {
-                    relative_path: relative,
-                    status: DirectoryStatus::AlreadyExists,
-                    error: None,
-                }
-            }
-            Err(error) => DirectoryResult {
-                relative_path: relative,
-                status: DirectoryStatus::Failed,
-                error: Some(error.to_string()),
-            },
-        };
-        directories.push(entry);
+        directories.push(create_directory_result(relative, &destination));
     }
     Ok(ApplyResult {
         run_id: Uuid::new_v4().to_string(),
         started_at,
         finished_at: timestamp(),
         directories,
+        cancelled: token.is_cancelled(),
     })
+}
+
+fn create_directory_result(relative_path: String, destination: &Path) -> DirectoryResult {
+    match fs::create_dir(destination) {
+        Ok(()) => DirectoryResult {
+            relative_path,
+            status: DirectoryStatus::Created,
+            error: None,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && destination.is_dir() => {
+            DirectoryResult {
+                relative_path,
+                status: DirectoryStatus::AlreadyExists,
+                error: None,
+            }
+        }
+        Err(error) => DirectoryResult {
+            relative_path,
+            status: DirectoryStatus::Failed,
+            error: Some(error.to_string()),
+        },
+    }
 }
 
 fn timestamp() -> String {
@@ -817,6 +853,38 @@ struct ApplyCommand {
     profile_id: Option<String>,
 }
 
+fn record_apply_result(
+    database: &Database,
+    result: &ApplyResult,
+    profile_id: Option<&str>,
+) -> Result<(), NativeError> {
+    let created = result
+        .directories
+        .iter()
+        .filter(|entry| entry.status == DirectoryStatus::Created)
+        .count() as i64;
+    let payload = serde_json::to_string(&result.directories)
+        .map_err(|error| NativeError::new(NativeErrorCode::Internal, error.to_string()))?;
+    let status = if result.cancelled {
+        "cancelled"
+    } else if result
+        .directories
+        .iter()
+        .any(|entry| entry.status == DirectoryStatus::Failed)
+    {
+        "partial"
+    } else {
+        "completed"
+    };
+    database.record_run(
+        &result.run_id,
+        profile_id.unwrap_or(""),
+        status,
+        created,
+        &payload,
+    )
+}
+
 #[tauri::command]
 async fn apply_directories(
     command: ApplyCommand,
@@ -834,20 +902,7 @@ async fn apply_directories(
     let result =
         spawned.map_err(|error| NativeError::new(NativeErrorCode::Internal, error.to_string()))?;
     let (result, profile_id) = result?;
-    let created = result
-        .directories
-        .iter()
-        .filter(|entry| entry.status == DirectoryStatus::Created)
-        .count() as i64;
-    let payload = serde_json::to_string(&result.directories)
-        .map_err(|error| NativeError::new(NativeErrorCode::Internal, error.to_string()))?;
-    database.record_run(
-        &result.run_id,
-        profile_id.as_deref().unwrap_or(""),
-        "completed",
-        created,
-        &payload,
-    )?;
+    record_apply_result(&database, &result, profile_id.as_deref())?;
     Ok(result)
 }
 
@@ -898,4 +953,41 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Rootline");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn mkdir_reports_already_existing_directories() {
+        let target = tempdir().unwrap();
+        let existing = target.path().join("existing");
+        fs::create_dir(&existing).unwrap();
+        let result = create_directory_result("existing".into(), &existing);
+        assert_eq!(result.status, DirectoryStatus::AlreadyExists);
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn cancelled_apply_results_are_recorded_as_cancelled_history() {
+        let directory = tempdir().unwrap();
+        let database = Database::open(directory.path().join("history.sqlite3")).unwrap();
+        let result = ApplyResult {
+            run_id: "cancelled-run".into(),
+            started_at: "x".into(),
+            finished_at: "y".into(),
+            directories: vec![DirectoryResult {
+                relative_path: "docs".into(),
+                status: DirectoryStatus::Created,
+                error: None,
+            }],
+            cancelled: true,
+        };
+        record_apply_result(&database, &result, Some("profile-1")).unwrap();
+        let history = database.run_history().unwrap();
+        assert_eq!(history[0].status, "cancelled");
+        assert_eq!(history[0].created_count, 1);
+    }
 }

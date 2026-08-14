@@ -19,6 +19,8 @@ export interface ScanRequest {
 
 export interface ScanPlan {
   operationId: string;
+  sourceRoot: string;
+  targetRoot: string;
   sourceFingerprint: string;
   targetFingerprint: string;
   targetCaseSensitive: boolean;
@@ -33,6 +35,7 @@ export interface ApplyResult {
   runId: string;
   startedAt: string;
   finishedAt: string;
+  cancelled: boolean;
   directories: Array<{ relativePath: string; status: DirectoryStatus; error?: string }>;
 }
 
