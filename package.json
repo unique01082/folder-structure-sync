@@ -10,7 +10,7 @@
   "packageManager": "pnpm@10.33.0",
   "scripts": {
     "build": "pnpm -r --if-present run build",
-    "test": "pnpm --filter @rootline/contracts test",
+    "test": "pnpm -r --if-present run test",
     "typecheck": "pnpm -r --if-present run typecheck"
   },
   "devDependencies": {

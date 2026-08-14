@@ -62,6 +62,10 @@ temp/
 # Build outputs
 dist/
 build/
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/icons/android/
+apps/desktop/src-tauri/icons/ios/
 
 # Test directories (when added)
 test-source/
