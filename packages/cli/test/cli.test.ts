@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { run as runProgram } from "../src/index.js";
 
 const directories: string[] = [];
 const cliPath = join(process.cwd(), "dist", "index.js");
@@ -61,7 +62,10 @@ describe("folder-sync command", () => {
     const result = run(source, target, "--json");
 
     expect(result.status).toBe(0);
-    expect(JSON.parse(result.stdout)).toMatchObject({ target: { status: "would-create" } });
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      target: { status: "would-create" },
+      plan: { missing: ["src"] },
+    });
     await expect(lstat(target)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
@@ -117,5 +121,29 @@ describe("folder-sync command", () => {
     expect(output.directories).toEqual(expect.arrayContaining([
       expect.objectContaining({ relativePath: "blocked", status: "failed" }),
     ]));
+  });
+
+  it("keeps the legacy verbose flag observable in text output", async () => {
+    const workspace = await tempDirectory();
+    const source = join(workspace, "source");
+    const target = join(workspace, "target");
+    await Promise.all([mkdir(join(source, "src"), { recursive: true }), mkdir(target)]);
+
+    const result = run(source, target, "--auto", "--verbose");
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Source entries: 1");
+  });
+
+  it("uses the cancelled exit code when an interactive user declines", async () => {
+    const workspace = await tempDirectory();
+    const source = join(workspace, "source");
+    const target = join(workspace, "target");
+    await Promise.all([mkdir(join(source, "src"), { recursive: true }), mkdir(target)]);
+
+    const result = await runProgram([source, target], workspace, async () => false);
+
+    expect(result.exitCode).toBe(4);
+    expect(result.output).toMatchObject({ cancelled: true });
   });
 });

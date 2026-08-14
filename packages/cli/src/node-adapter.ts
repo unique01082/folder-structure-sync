@@ -6,6 +6,7 @@ import {
   assertPlanFresh,
   createRootlineError,
   createSnapshot,
+  compareRelativePaths,
   matchesExclusion,
   selectPlanSubtree,
   throwIfCancelled,
@@ -99,11 +100,13 @@ export async function resolveConfig(options: ResolveConfigOptions): Promise<Reso
   if (parsed.targetCaseSensitive !== undefined && typeof parsed.targetCaseSensitive !== "boolean") {
     return configError("targetCaseSensitive must be a boolean.", candidate);
   }
-  const defaults = requireStringArray(parsed.defaultExclusions, "defaultExclusions", candidate);
+  const defaults = parsed.defaultExclusions === undefined
+    ? DEFAULT_EXCLUSIONS
+    : requireStringArray(parsed.defaultExclusions, "defaultExclusions", candidate);
   const custom = requireStringArray(parsed.customExclusions, "customExclusions", candidate);
   return {
     path: candidate,
-    exclusions: [...(defaults.length > 0 ? defaults : DEFAULT_EXCLUSIONS), ...custom],
+    exclusions: [...defaults, ...custom],
     targetCaseSensitive: parsed.targetCaseSensitive ?? defaultCaseSensitivity(),
   };
 }
@@ -135,6 +138,7 @@ export interface ApplyResult {
 
 export interface ApplyOptions {
   readonly exclusions: readonly string[];
+  readonly sourcePath: string;
   readonly selected?: readonly string[];
   readonly dryRun?: boolean;
   readonly signal?: CancellationSignalLike;
@@ -175,7 +179,7 @@ export class NodeFileSystemAdapter {
       }
       let names: string[];
       try {
-        names = (await fs.readdir(currentPath)).sort((left, right) => left.localeCompare(right));
+        names = (await fs.readdir(currentPath)).sort(compareRelativePaths);
       } catch (error: unknown) {
         throw unreadable(currentPath, error);
       }
@@ -234,13 +238,15 @@ export class NodeFileSystemAdapter {
 
   async applyDirectories(
     targetPath: string,
-    source: DirectorySnapshot,
     plan: SyncPlan,
     options: ApplyOptions,
   ): Promise<ApplyResult> {
     throwIfCancelled(options.signal);
-    const currentTarget = (await this.scanDirectories(targetPath, options.exclusions, "target", options.signal)).snapshot;
-    assertPlanFresh(plan, source, currentTarget);
+    const [currentSource, currentTarget] = await Promise.all([
+      this.scanDirectories(options.sourcePath, options.exclusions, "source", options.signal),
+      this.scanDirectories(targetPath, options.exclusions, "target", options.signal),
+    ]);
+    assertPlanFresh(plan, currentSource.snapshot, currentTarget.snapshot);
     const selected = options.selected ?? plan.missing;
     const directories = selectPlanSubtree(plan, selected);
     const result: DirectoryResult[] = [];

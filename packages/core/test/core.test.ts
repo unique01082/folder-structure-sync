@@ -14,6 +14,7 @@ import {
 describe("Rootline synchronization core", () => {
   it("normalizes portable relative paths and rejects traversal", () => {
     expect(normalizeRelativePath("src\\components//ui")).toBe("src/components/ui");
+    expect(normalizeRelativePath(" docs ")).toBe(" docs ");
     expect(() => normalizeRelativePath("../outside")).toThrow("relative path");
   });
 
@@ -37,6 +38,7 @@ describe("Rootline synchronization core", () => {
       "app/routes/admin",
     ]);
     expect(createSnapshot([...source.entries].reverse()).fingerprint).toBe(source.fingerprint);
+    expect(createSnapshot(["z", "ä", "a"]).entries).toEqual(["a", "z", "ä"]);
   });
 
   it("rejects equal or overlapping synchronization roots", () => {
@@ -54,5 +56,8 @@ describe("Rootline synchronization core", () => {
     expect(createSyncPlan(source, target, false).missing).toEqual([]);
     expect(() => assertPlanFresh(plan, source, target)).toThrow("changed");
     expect(() => throwIfCancelled({ aborted: true })).toThrow("cancelled");
+
+    const forgedPlan = { ...plan, missing: ["outside"], fingerprint: plan.fingerprint };
+    expect(() => assertPlanFresh(forgedPlan, source, createSnapshot([]))).toThrow("changed");
   });
 });

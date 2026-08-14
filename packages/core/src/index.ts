@@ -14,6 +14,7 @@ export interface DirectorySnapshot {
 export interface SyncPlan {
   readonly sourceFingerprint: string;
   readonly targetFingerprint: string;
+  readonly targetCaseSensitive: boolean;
   readonly missing: readonly string[];
   readonly fingerprint: string;
 }
@@ -32,7 +33,7 @@ function invalidPath(message: string, value: string): never {
 
 /** Converts a relative directory name to the portable format used by snapshots. */
 export function normalizeRelativePath(value: string): string {
-  const normalized = value.trim().replace(/\\/g, "/").replace(/\/+/g, "/");
+  const normalized = value.replace(/\\/g, "/").replace(/\/+/g, "/");
   if (normalized === "" || normalized === ".") {
     return "";
   }
@@ -86,10 +87,13 @@ export function fingerprint(entries: readonly string[]): string {
   return `fnv1a-${(hash >>> 0).toString(16).padStart(8, "0")}`;
 }
 
+/** Locale-independent ordering keeps plans and fingerprints portable across hosts. */
+export function compareRelativePaths(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 export function createSnapshot(entries: readonly string[]): DirectorySnapshot {
-  const normalized = [...new Set(entries.map(normalizeRelativePath).filter(Boolean))].sort((left, right) =>
-    left.localeCompare(right),
-  );
+  const normalized = [...new Set(entries.map(normalizeRelativePath).filter(Boolean))].sort(compareRelativePaths);
   return Object.freeze({ entries: Object.freeze(normalized), fingerprint: fingerprint(normalized) });
 }
 
@@ -98,13 +102,14 @@ export function createSyncPlan(
   target: DirectorySnapshot,
   targetCaseSensitive = true,
 ): SyncPlan {
-  const comparable = (entry: string) => targetCaseSensitive ? entry : entry.toLocaleLowerCase();
+  const comparable = (entry: string) => targetCaseSensitive ? entry : entry.toLowerCase();
   const targetEntries = new Set(target.entries.map(comparable));
   const missing = source.entries.filter((entry) => !targetEntries.has(comparable(entry)));
-  const planEntries = [source.fingerprint, target.fingerprint, ...missing];
+  const planEntries = [source.fingerprint, target.fingerprint, targetCaseSensitive ? "case-sensitive" : "case-insensitive", ...missing];
   return Object.freeze({
     sourceFingerprint: source.fingerprint,
     targetFingerprint: target.fingerprint,
+    targetCaseSensitive,
     missing: Object.freeze(missing),
     fingerprint: fingerprint(planEntries),
   });
@@ -129,7 +134,7 @@ export function selectPlanSubtree(plan: SyncPlan, requested: readonly string[]):
   }
   return [...selected].sort((left, right) => {
     const depth = left.split("/").length - right.split("/").length;
-    return depth === 0 ? left.localeCompare(right) : depth;
+    return depth === 0 ? compareRelativePaths(left, right) : depth;
   });
 }
 
@@ -159,7 +164,14 @@ export function assertPlanFresh(
   source: DirectorySnapshot,
   target: DirectorySnapshot,
 ): void {
-  if (plan.sourceFingerprint !== source.fingerprint || plan.targetFingerprint !== target.fingerprint) {
+  const expected = createSyncPlan(source, target, plan.targetCaseSensitive);
+  if (
+    plan.sourceFingerprint !== source.fingerprint ||
+    plan.targetFingerprint !== target.fingerprint ||
+    plan.fingerprint !== expected.fingerprint ||
+    plan.missing.length !== expected.missing.length ||
+    plan.missing.some((entry, index) => entry !== expected.missing[index])
+  ) {
     throw createRootlineError({
       code: ROOTLINE_ERROR_CODES.STALE_PLAN,
       message: "The filesystem changed after this plan was created.",

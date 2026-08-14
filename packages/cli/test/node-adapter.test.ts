@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -34,6 +34,9 @@ describe("Node filesystem adapter", () => {
       path: join(cwd, "sync-config.json"),
       exclusions: expect.arrayContaining(["cwd-only"]),
     });
+
+    await writeFile(explicit, JSON.stringify({ defaultExclusions: [], customExclusions: [] }));
+    await expect(resolveConfig({ cwd, explicitPath: explicit })).resolves.toMatchObject({ exclusions: [] });
   });
 
   it("skips symlinks and exact excluded segments while retaining .github", async () => {
@@ -64,6 +67,21 @@ describe("Node filesystem adapter", () => {
     });
   });
 
+  it("reports an unreadable child directory instead of silently creating an incomplete snapshot", async () => {
+    const root = await tempDirectory();
+    const locked = join(root, "locked");
+    await mkdir(locked);
+    await chmod(locked, 0o000);
+
+    try {
+      await expect(new NodeFileSystemAdapter().scanDirectories(root, [])).rejects.toMatchObject({
+        code: "UNREADABLE_PATH",
+      });
+    } finally {
+      await chmod(locked, 0o700);
+    }
+  });
+
   it("reports target mkdir states and observes cancellation at operation boundaries", async () => {
     const target = join(await tempDirectory(), "target");
     const adapter = new NodeFileSystemAdapter();
@@ -78,19 +96,21 @@ describe("Node filesystem adapter", () => {
 
   it("revalidates stale plans before mkdir and reports per-directory results", async () => {
     const target = await tempDirectory();
+    const sourceRoot = await tempDirectory();
     const adapter = new NodeFileSystemAdapter();
     const source = createSnapshot(["blocked", "blocked/child", "created"]);
     const originalTarget = createSnapshot([]);
     const plan = createSyncPlan(source, originalTarget);
+    await Promise.all(source.entries.map((entry) => mkdir(join(sourceRoot, entry), { recursive: true })));
     await mkdir(join(target, "changed-after-plan"));
     await writeFile(join(target, "blocked"), "not a directory");
 
     await expect(
-      adapter.applyDirectories(target, source, plan, { exclusions: [] }),
+      adapter.applyDirectories(target, plan, { exclusions: [], sourcePath: sourceRoot }),
     ).rejects.toMatchObject({ code: "STALE_PLAN" });
 
     const currentPlan = createSyncPlan(source, (await adapter.scanDirectories(target, [])).snapshot);
-    const result = await adapter.applyDirectories(target, source, currentPlan, { exclusions: [] });
+    const result = await adapter.applyDirectories(target, currentPlan, { exclusions: [], sourcePath: sourceRoot });
 
     expect(result.directories).toEqual(
       expect.arrayContaining([
@@ -99,5 +119,19 @@ describe("Node filesystem adapter", () => {
       ]),
     );
     await expect(readFile(join(target, "created"), "utf8")).rejects.toThrow();
+  });
+
+  it("rejects a source tree that changed after planning", async () => {
+    const sourceRoot = await tempDirectory();
+    const target = await tempDirectory();
+    const adapter = new NodeFileSystemAdapter();
+    await mkdir(join(sourceRoot, "planned"));
+    const source = (await adapter.scanDirectories(sourceRoot, [])).snapshot;
+    const plan = createSyncPlan(source, createSnapshot([]));
+    await mkdir(join(sourceRoot, "added-after-plan"));
+
+    await expect(adapter.applyDirectories(target, plan, { exclusions: [], sourcePath: sourceRoot })).rejects.toMatchObject({
+      code: "STALE_PLAN",
+    });
   });
 });

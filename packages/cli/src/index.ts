@@ -122,7 +122,11 @@ async function confirm(message: string): Promise<boolean> {
   }
 }
 
-export async function run(arguments_: readonly string[], cwd = process.cwd()): Promise<{ output: CliOutput; exitCode: number; text?: string }> {
+export async function run(
+  arguments_: readonly string[],
+  cwd = process.cwd(),
+  confirmOperation: (message: string) => Promise<boolean> = confirm,
+): Promise<{ output: CliOutput; exitCode: number; text?: string }> {
   let options: CliOptions;
   try {
     options = parseArguments(arguments_);
@@ -136,12 +140,9 @@ export async function run(arguments_: readonly string[], cwd = process.cwd()): P
     const adapter = new NodeFileSystemAdapter();
     const source = await adapter.scanDirectories(sourcePath, config.exclusions, "source");
     let targetStatus = await adapter.ensureTarget(targetPath, options.dryRun || !options.auto);
-    if (targetStatus === "would-create" && !options.dryRun) {
-      if (options.json) {
-        return { output: { source: { entries: source.snapshot.entries.length, skippedSymlinks: source.skippedSymlinks }, target: { status: "would-create" } }, exitCode: EXIT_CODES.SUCCESS };
-      }
-      if (!(await confirm("Create the missing target directory?"))) {
-        return { output: { cancelled: true }, exitCode: EXIT_CODES.SUCCESS };
+    if (targetStatus === "would-create" && !options.dryRun && !options.json) {
+      if (!(await confirmOperation("Create the missing target directory?"))) {
+        return { output: { cancelled: true }, exitCode: EXIT_CODES.CANCELLED };
       }
       targetStatus = await adapter.ensureTarget(targetPath);
     }
@@ -161,11 +162,17 @@ export async function run(arguments_: readonly string[], cwd = process.cwd()): P
       return { output, exitCode: EXIT_CODES.SUCCESS };
     }
     if (!options.auto) {
-      if (options.json || !(await confirm(`Create ${plan.missing.length} missing folder(s)?`))) {
+      if (options.json) {
         return { output: { ...output, cancelled: true }, exitCode: EXIT_CODES.SUCCESS };
       }
+      if (!(await confirmOperation(`Create ${plan.missing.length} missing folder(s)?`))) {
+        return { output: { ...output, cancelled: true }, exitCode: EXIT_CODES.CANCELLED };
+      }
     }
-    const result = await adapter.applyDirectories(targetPath, source.snapshot, plan, { exclusions: config.exclusions });
+    const result = await adapter.applyDirectories(targetPath, plan, {
+      exclusions: config.exclusions,
+      sourcePath,
+    });
     output.directories = result.directories;
     if (result.directories.some((directory) => directory.status === "failed")) {
       output.error = { code: ROOTLINE_ERROR_CODES.PARTIAL_FAILURE, message: "Some directories could not be created." };
@@ -180,7 +187,7 @@ export async function run(arguments_: readonly string[], cwd = process.cwd()): P
   }
 }
 
-function printResult(result: { output: CliOutput; exitCode: number; text?: string }, json: boolean): void {
+function printResult(result: { output: CliOutput; exitCode: number; text?: string }, json: boolean, verbose: boolean): void {
   if (json) {
     process.stdout.write(`${JSON.stringify(result.output)}\n`);
     return;
@@ -190,6 +197,9 @@ function printResult(result: { output: CliOutput; exitCode: number; text?: strin
   } else if (result.output.error) {
     process.stderr.write(`Error [${result.output.error.code}]: ${result.output.error.message}\n`);
   } else {
+    if (verbose && result.output.source && result.output.target) {
+      process.stdout.write(`Source entries: ${result.output.source.entries}\nTarget entries: ${result.output.target.entries ?? 0}\n`);
+    }
     process.stdout.write(`${JSON.stringify(result.output, null, 2)}\n`);
   }
 }
@@ -197,8 +207,9 @@ function printResult(result: { output: CliOutput; exitCode: number; text?: strin
 const invokedAsCommand = process.argv[1] !== undefined && realpathSync(process.argv[1]) === realpathSync(new URL(import.meta.url));
 if (invokedAsCommand) {
   const json = process.argv.includes("--json");
+  const verbose = process.argv.includes("--verbose") || process.argv.includes("-v");
   run(process.argv.slice(2)).then((result) => {
-    printResult(result, json);
+    printResult(result, json, verbose);
     process.exitCode = result.exitCode;
   });
 }
