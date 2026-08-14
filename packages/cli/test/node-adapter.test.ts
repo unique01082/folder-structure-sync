@@ -1,0 +1,103 @@
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import { createSnapshot, createSyncPlan } from "@rootline/core";
+import { NodeFileSystemAdapter, resolveConfig } from "../src/node-adapter.js";
+
+const temporaryDirectories: string[] = [];
+
+async function tempDirectory(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "rootline-cli-test-"));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+});
+
+describe("Node filesystem adapter", () => {
+  it("resolves an explicit config ahead of the working-directory config", async () => {
+    const cwd = await tempDirectory();
+    const explicit = join(cwd, "explicit.json");
+    await writeFile(join(cwd, "sync-config.json"), JSON.stringify({ customExclusions: ["cwd-only"] }));
+    await writeFile(explicit, JSON.stringify({ customExclusions: ["explicit-only"] }));
+
+    await expect(resolveConfig({ cwd, explicitPath: explicit })).resolves.toMatchObject({
+      path: explicit,
+      exclusions: expect.arrayContaining(["explicit-only"]),
+    });
+    await expect(resolveConfig({ cwd })).resolves.toMatchObject({
+      path: join(cwd, "sync-config.json"),
+      exclusions: expect.arrayContaining(["cwd-only"]),
+    });
+  });
+
+  it("skips symlinks and exact excluded segments while retaining .github", async () => {
+    const root = await tempDirectory();
+    await mkdir(join(root, ".git", "objects"), { recursive: true });
+    await mkdir(join(root, ".github", "workflows"), { recursive: true });
+    await mkdir(join(root, "real"), { recursive: true });
+    await symlink(join(root, "real"), join(root, "linked"));
+
+    const scan = await new NodeFileSystemAdapter().scanDirectories(root, [".git"]);
+
+    expect(scan.snapshot.entries).toEqual([".github", ".github/workflows", "real"]);
+    expect(scan.skippedSymlinks).toEqual(["linked"]);
+  });
+
+  it("honors legacy .ignore pruning and maps non-directory roots to unreadable errors", async () => {
+    const root = await tempDirectory();
+    const file = join(root, "file");
+    await mkdir(join(root, "ignored", "child"), { recursive: true });
+    await writeFile(join(root, "ignored", ".ignore"), "");
+    await writeFile(file, "not a directory");
+
+    await expect(new NodeFileSystemAdapter().scanDirectories(root, [])).resolves.toMatchObject({
+      snapshot: { entries: ["ignored"] },
+    });
+    await expect(new NodeFileSystemAdapter().scanDirectories(file, [])).rejects.toMatchObject({
+      code: "UNREADABLE_PATH",
+    });
+  });
+
+  it("reports target mkdir states and observes cancellation at operation boundaries", async () => {
+    const target = join(await tempDirectory(), "target");
+    const adapter = new NodeFileSystemAdapter();
+
+    await expect(adapter.ensureTarget(target, true)).resolves.toBe("would-create");
+    await expect(adapter.ensureTarget(target)).resolves.toBe("created");
+    await expect(adapter.ensureTarget(target)).resolves.toBe("already-exists");
+    await expect(adapter.scanDirectories(target, [], "source", { aborted: true })).rejects.toMatchObject({
+      code: "CANCELLED",
+    });
+  });
+
+  it("revalidates stale plans before mkdir and reports per-directory results", async () => {
+    const target = await tempDirectory();
+    const adapter = new NodeFileSystemAdapter();
+    const source = createSnapshot(["blocked", "blocked/child", "created"]);
+    const originalTarget = createSnapshot([]);
+    const plan = createSyncPlan(source, originalTarget);
+    await mkdir(join(target, "changed-after-plan"));
+    await writeFile(join(target, "blocked"), "not a directory");
+
+    await expect(
+      adapter.applyDirectories(target, source, plan, { exclusions: [] }),
+    ).rejects.toMatchObject({ code: "STALE_PLAN" });
+
+    const currentPlan = createSyncPlan(source, (await adapter.scanDirectories(target, [])).snapshot);
+    const result = await adapter.applyDirectories(target, source, currentPlan, { exclusions: [] });
+
+    expect(result.directories).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ relativePath: "created", status: "created" }),
+        expect.objectContaining({ relativePath: "blocked/child", status: "failed" }),
+      ]),
+    );
+    await expect(readFile(join(target, "created"), "utf8")).rejects.toThrow();
+  });
+});
