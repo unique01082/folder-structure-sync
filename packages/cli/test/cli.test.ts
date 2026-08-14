@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,7 +10,7 @@ const directories: string[] = [];
 const cliPath = join(process.cwd(), "dist", "index.js");
 
 async function tempDirectory(): Promise<string> {
-  const directory = await mkdtemp(join(tmpdir(), "rootline-command-test-"));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "rootline-command-test-")));
   directories.push(directory);
   return directory;
 }
@@ -173,7 +173,52 @@ describe("folder-sync command", () => {
     const result = run(source, target, "--auto", "--json");
 
     expect(result.status).toBe(1);
-    expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "PATH_OVERLAP" } });
+    expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "INVALID_PATH" } });
     await expect(lstat(join(source, "nested"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a supplied target symlink before it can create directories outside target", async () => {
+    const workspace = await tempDirectory();
+    const source = join(workspace, "source");
+    const external = join(workspace, "external");
+    const targetAlias = join(workspace, "target-alias");
+    await Promise.all([mkdir(join(source, "required"), { recursive: true }), mkdir(external)]);
+    await symlink(external, targetAlias, "dir");
+
+    const result = run(source, targetAlias, "--auto", "--json");
+
+    expect(result.status).toBe(1);
+    expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "INVALID_PATH" } });
+    await expect(lstat(join(external, "required"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a non-overlapping target ancestor link before mkdir", async () => {
+    const workspace = await tempDirectory();
+    const source = join(workspace, "source");
+    const external = join(workspace, "external");
+    const targetAlias = join(workspace, "target-alias");
+    await Promise.all([mkdir(join(source, "required"), { recursive: true }), mkdir(external)]);
+    await symlink(external, targetAlias, "dir");
+
+    const result = run(source, join(targetAlias, "nested"), "--auto", "--json");
+
+    expect(result.status).toBe(1);
+    expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "INVALID_PATH" } });
+    await expect(lstat(join(external, "nested"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a supplied source symlink before scanning it", async () => {
+    const workspace = await tempDirectory();
+    const source = join(workspace, "source");
+    const sourceAlias = join(workspace, "source-alias");
+    const target = join(workspace, "target");
+    await Promise.all([mkdir(join(source, "required"), { recursive: true }), mkdir(target)]);
+    await symlink(source, sourceAlias, "dir");
+
+    const result = run(sourceAlias, target, "--auto", "--json");
+
+    expect(result.status).toBe(1);
+    expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "INVALID_PATH" } });
+    await expect(lstat(join(target, "required"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

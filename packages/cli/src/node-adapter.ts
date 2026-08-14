@@ -146,6 +146,8 @@ export interface ApplyOptions {
 
 export class NodeFileSystemAdapter {
   async validateRootPaths(sourcePath: string, targetPath: string): Promise<{ sourcePath: string; targetPath: string }> {
+    await this.assertNoLinkedAncestor(sourcePath);
+    await this.assertNoLinkedAncestor(targetPath);
     const [canonicalSource, canonicalTarget] = await Promise.all([
       this.canonicalizeExistingPrefix(sourcePath),
       this.canonicalizeExistingPrefix(targetPath),
@@ -161,6 +163,7 @@ export class NodeFileSystemAdapter {
   ): Promise<DirectoryScan> {
     throwIfCancelled(signal);
     const absoluteRoot = resolve(rootPath);
+    await this.assertNoLinkedAncestor(absoluteRoot);
     const canonicalRoot = await this.canonicalizeExistingPrefix(absoluteRoot);
     let rootStat;
     try {
@@ -223,6 +226,7 @@ export class NodeFileSystemAdapter {
 
   async ensureTarget(targetPath: string, dryRun = false): Promise<"created" | "already-exists" | "would-create"> {
     const absoluteTarget = resolve(targetPath);
+    await this.assertNoLinkedAncestor(absoluteTarget);
     const canonicalTarget = await this.canonicalizeExistingPrefix(absoluteTarget);
     try {
       const stat = await fs.lstat(canonicalTarget);
@@ -239,6 +243,7 @@ export class NodeFileSystemAdapter {
       return "would-create";
     }
     try {
+      await this.assertNoLinkedAncestor(absoluteTarget);
       await fs.mkdir(canonicalTarget, { recursive: true });
       return "created";
     } catch (error: unknown) {
@@ -252,6 +257,8 @@ export class NodeFileSystemAdapter {
     options: ApplyOptions,
   ): Promise<ApplyResult> {
     throwIfCancelled(options.signal);
+    await this.assertNoLinkedAncestor(targetPath);
+    await this.assertNoLinkedAncestor(options.sourcePath);
     const canonicalTarget = await this.canonicalizeExistingPrefix(targetPath);
     const canonicalSource = await this.canonicalizeExistingPrefix(options.sourcePath);
     const [currentSource, currentTarget] = await Promise.all([
@@ -270,14 +277,7 @@ export class NodeFileSystemAdapter {
         continue;
       }
       try {
-        if ((await this.canonicalizeExistingPrefix(fullPath)) !== fullPath) {
-          result.push({
-            relativePath,
-            status: "failed",
-            error: "A target path component traverses a symbolic link or junction.",
-          });
-          continue;
-        }
+        await this.assertNoLinkedAncestor(fullPath);
         const existing = await fs.lstat(fullPath).catch((error: unknown) => (isMissing(error) ? undefined : Promise.reject(error)));
         if (existing?.isDirectory()) {
           result.push({ relativePath, status: "already-exists" });
@@ -323,6 +323,31 @@ export class NodeFileSystemAdapter {
         missing.unshift(basename(current));
         current = parent;
       }
+    }
+  }
+
+  private async assertNoLinkedAncestor(path: string): Promise<void> {
+    let current = resolve(path);
+    while (true) {
+      try {
+        const stat = await fs.lstat(current);
+        if (stat.isSymbolicLink()) {
+          throw createRootlineError({
+            code: ROOTLINE_ERROR_CODES.INVALID_PATH,
+            message: "A synchronization root must not traverse a symbolic link or junction.",
+            details: { path: resolve(path), linkedAncestor: current },
+          });
+        }
+      } catch (error: unknown) {
+        if (!isMissing(error)) {
+          throw error;
+        }
+      }
+      const parent = dirname(current);
+      if (parent === current) {
+        return;
+      }
+      current = parent;
     }
   }
 }

@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -10,7 +10,7 @@ import { NodeFileSystemAdapter, resolveConfig } from "../src/node-adapter.js";
 const temporaryDirectories: string[] = [];
 
 async function tempDirectory(): Promise<string> {
-  const directory = await mkdtemp(join(tmpdir(), "rootline-cli-test-"));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "rootline-cli-test-")));
   temporaryDirectories.push(directory);
   return directory;
 }

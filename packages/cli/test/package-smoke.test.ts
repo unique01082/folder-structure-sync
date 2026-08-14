@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
 const workspace = join(process.cwd(), "../..");
-const scratch = await mkdtemp(join(tmpdir(), "rootline-package-smoke-"));
+const scratch = await realpath(await mkdtemp(join(tmpdir(), "rootline-package-smoke-")));
 
 function execute(command: string, arguments_: string[], cwd = workspace) {
   const result = spawnSync(command, arguments_, {
