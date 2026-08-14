@@ -50,6 +50,7 @@ coverage/
 # Temporary folders
 tmp/
 temp/
+.worktrees/
 
 # Optional npm cache directory
 .npm
