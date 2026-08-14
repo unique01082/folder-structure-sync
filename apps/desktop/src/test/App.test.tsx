@@ -187,6 +187,7 @@ describe("Rootline desktop workflow", () => {
     }} />);
     await user.click(screen.getByRole("button", { name: "Scan differences" }));
     await screen.findByRole("heading", { name: "Review 4 missing folders" });
+    expect(screen.getByRole("tree", { name: "Missing folders" })).toHaveAttribute("aria-multiselectable", "true");
     const results = await axe.run(container);
     expect(results.violations).toEqual([]);
   });

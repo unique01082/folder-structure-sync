@@ -177,7 +177,7 @@ export const DiffTree = memo(function DiffTree({ entries, selected, onSelectionC
         <span>{labels.visibleCount(visible.length)}</span>
         <span>{labels.selectedCount(selected.size)}</span>
       </div>
-      <div ref={viewport} className="tree-viewport" role="tree" aria-label={labels.missingFolders} onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}>
+      <div ref={viewport} className="tree-viewport" role="tree" aria-label={labels.missingFolders} aria-multiselectable="true" onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}>
         <div className="tree-spacer" role="presentation" style={{ height: `${visible.length * ROW_HEIGHT}px` }}>
           {windowed.map((entry, offset) => {
             const index = start + offset;

@@ -500,6 +500,16 @@ pub fn apply_plan(
     selected: &[String],
     token: &CancellationToken,
 ) -> Result<ApplyResult, NativeError> {
+    apply_plan_with_observer(request, plan, selected, token, |_| {})
+}
+
+fn apply_plan_with_observer(
+    request: &ScanRequest,
+    plan: &ScanPlan,
+    selected: &[String],
+    token: &CancellationToken,
+    mut after_directory: impl FnMut(&DirectoryResult),
+) -> Result<ApplyResult, NativeError> {
     let started_at = timestamp();
     let source = canonical_directory(&request.source_path, "source")?;
     let target = canonical_directory(&request.target_path, "target")?;
@@ -538,7 +548,9 @@ pub fn apply_plan(
             .split('/')
             .fold(target.clone(), |path, part| path.join(part));
         assert_no_link_below(&target, &destination)?;
-        directories.push(create_directory_result(relative, &destination));
+        let entry = create_directory_result(relative, &destination);
+        after_directory(&entry);
+        directories.push(entry);
     }
     Ok(ApplyResult {
         run_id: Uuid::new_v4().to_string(),
@@ -989,5 +1001,33 @@ mod tests {
         let history = database.run_history().unwrap();
         assert_eq!(history[0].status, "cancelled");
         assert_eq!(history[0].created_count, 1);
+    }
+
+    #[test]
+    fn cancellation_after_a_mkdir_returns_that_accumulated_result_deterministically() {
+        let source = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        fs::create_dir(source.path().join("first")).unwrap();
+        fs::create_dir(source.path().join("second")).unwrap();
+        let request = ScanRequest {
+            operation_id: "observed-apply".into(),
+            source_path: source.path().into(),
+            target_path: target.path().into(),
+            exclusions: Vec::new(),
+        };
+        let plan = scan_plan(&request, &CancellationToken::default()).unwrap();
+        let token = CancellationToken::default();
+        let observer_token = token.clone();
+        let result =
+            apply_plan_with_observer(&request, &plan, &plan.missing, &token, move |entry| {
+                assert_eq!(entry.relative_path, "first");
+                observer_token.cancel();
+            })
+            .unwrap();
+        assert!(result.cancelled);
+        assert_eq!(result.directories.len(), 1);
+        assert_eq!(result.directories[0].status, DirectoryStatus::Created);
+        assert!(target.path().join("first").is_dir());
+        assert!(!target.path().join("second").exists());
     }
 }

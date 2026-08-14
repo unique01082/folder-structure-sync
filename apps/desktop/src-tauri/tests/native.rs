@@ -104,37 +104,6 @@ fn reports_case_semantics_and_failed_directory_creation() {
 }
 
 #[test]
-fn returns_accumulated_results_when_cancelled_during_mkdir() {
-    let source = tempdir().unwrap();
-    let target = tempdir().unwrap();
-    for index in 0..2_000 {
-        fs::create_dir(source.path().join(format!("folder-{index:04}"))).unwrap();
-    }
-    let scan_request = request(source.path(), target.path());
-    let plan = scan_plan(&scan_request, &CancellationToken::default()).unwrap();
-    let token = CancellationToken::default();
-    let worker_token = token.clone();
-    let selected = plan.missing.clone();
-    let worker =
-        std::thread::spawn(move || apply_plan(&scan_request, &plan, &selected, &worker_token));
-    for _ in 0..10_000 {
-        if fs::read_dir(target.path()).unwrap().any(|entry| {
-            entry
-                .and_then(|value| value.file_type())
-                .is_ok_and(|file_type| file_type.is_dir())
-        }) {
-            token.cancel();
-            break;
-        }
-        std::thread::yield_now();
-    }
-    let result = worker.join().unwrap().unwrap();
-    assert!(result.cancelled);
-    assert!(!result.directories.is_empty());
-    assert!(result.directories.len() < 2_000);
-}
-
-#[test]
 fn rejects_overlapping_roots_and_honors_cancellation() {
     let source = tempdir().unwrap();
     fs::create_dir(source.path().join("child")).unwrap();
