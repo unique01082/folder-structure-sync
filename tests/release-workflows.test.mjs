@@ -99,6 +99,12 @@ test("CI covers TypeScript quality, real PostgreSQL, Rust, npm smoke, and the su
   ]) assert.match(ci, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   const postgresSteps = parsedWorkflow("ci.yml").jobs["postgres-integration"].steps;
   assert.ok(postgresSteps.some((step) => String(step.run ?? "").includes("libwebkit2gtk-4.1-dev")));
+  const tauriSteps = parsedWorkflow("ci.yml").jobs["tauri-build"].steps;
+  const windowsTests = tauriSteps.find((step) => step.name === "Run Windows filesystem adapter tests");
+  assert.equal(windowsTests?.if, "runner.os == 'Windows' && matrix.target == 'x86_64-pc-windows-msvc'");
+  assert.match(String(windowsTests?.run), /pnpm --filter folder-structure-sync test/);
+  assert.match(String(windowsTests?.run), /cargo test --manifest-path apps\/desktop\/src-tauri\/Cargo\.toml/);
+  assert.doesNotMatch(String(windowsTests?.run), /--target/);
 });
 
 test("npm 2.0.0 release fails closed before provenance publishing", () => {
@@ -243,10 +249,12 @@ test("desktop updater is registered and serves every default runtime target", ()
 test("release and privacy docs describe the real ordering and lazy receipt cleanup", () => {
   const release = readFileSync(join(root, "docs", "release.md"), "utf8");
   const privacy = readFileSync(join(root, "docs", "privacy.md"), "utf8");
+  const hostedSync = readFileSync(join(root, "docs", "hosted-profile-sync.md"), "utf8");
   const migrationIndex = release.indexOf("applies the checked-in migrations");
   const deploymentIndex = release.indexOf("calls the HTTPS deployment webhook");
 
   assert.ok(migrationIndex >= 0 && deploymentIndex >= 0 && migrationIndex < deploymentIndex);
   assert.match(privacy, /eligible for cleanup after 90 days/i);
   assert.match(privacy, /opportunistically on a later sync/i);
+  assert.match(hostedSync, /Application slug[^\n]*`rootline`/i);
 });

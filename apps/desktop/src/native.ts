@@ -47,8 +47,14 @@ export interface ApplyResult {
   directories: Array<{ relativePath: string; status: DirectoryStatus; error?: string }>;
 }
 
+export interface ProfileRootAvailability {
+  sourceAvailable: boolean;
+  targetAvailable: boolean;
+}
+
 export interface NativeGateway {
   chooseFolder(input: { role: "source" | "target" }): Promise<string | null>;
+  inspectProfileRoots(input: { sourcePath: string; targetPath: string }): Promise<ProfileRootAvailability>;
   scan(request: ScanRequest): Promise<ScanPlan>;
   apply(input: { request: ScanRequest; plan: ScanPlan; selected: string[]; profileId?: string }): Promise<ApplyResult>;
   cancel(operationId: string): Promise<void>;
@@ -59,6 +65,7 @@ export interface NativeGateway {
 
 export const tauriGateway: NativeGateway = {
   chooseFolder: ({ role }) => invoke<string | null>("choose_folder", { role }),
+  inspectProfileRoots: (input) => invoke<ProfileRootAvailability>("inspect_saved_profile_roots", input),
   scan: (request) => invoke<ScanPlan>("scan_directories", { request }),
   apply: (command) => invoke<ApplyResult>("apply_directories", { command }),
   cancel: (operationId) => invoke<void>("cancel_operation", { operationId }),

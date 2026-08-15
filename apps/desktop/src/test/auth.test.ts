@@ -415,7 +415,7 @@ describe("Rootline desktop authentication boundary", () => {
       signinRedirectCallback: vi.fn(), revokeTokens: vi.fn(), removeUser: vi.fn(),
     };
     tauriMocks.invoke.mockRejectedValue({
-      code: "SYNC_EPOCH_RESET_REQUIRED",
+      code: "RESET_REQUIRED",
       message: "Existing hosted account epoch found.",
       details: {
         epoch: "00000000-0000-4000-8000-000000000123",
@@ -424,7 +424,7 @@ describe("Rootline desktop authentication boundary", () => {
     });
     const auth = new DesktopAuthController(config, manager as never);
     await auth.initialize();
-    await expect(auth.sync()).rejects.toEqual(expect.objectContaining({ code: "SYNC_EPOCH_RESET_REQUIRED" }));
+    await expect(auth.sync()).rejects.toEqual(expect.objectContaining({ code: "RESET_REQUIRED" }));
     expect(auth.snapshot()).toEqual(expect.objectContaining({
       epochResetRequired: true,
       epochResetPreservesConsentedOutbox: true,

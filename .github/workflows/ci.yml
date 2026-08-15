@@ -136,4 +136,12 @@ jobs:
         with:
           workspaces: apps/desktop/src-tauri
       - run: pnpm install --frozen-lockfile
+      - name: Run Windows filesystem adapter tests
+        if: runner.os == 'Windows' && matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          pnpm --filter folder-structure-sync test
+          if ($LASTEXITCODE -ne 0) { throw "Node filesystem adapter tests failed on Windows." }
+          cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw "Rust filesystem adapter tests failed on Windows." }
       - run: pnpm --filter @rootline/desktop tauri build --target ${{ matrix.target }} --no-bundle

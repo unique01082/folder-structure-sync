@@ -29,6 +29,7 @@ model ProfileRecord {
   profile     Json?
   deletedAt   DateTime? @map("deleted_at")
   revision    BigInt
+  lastDeviceId String   @map("last_device_id")
   committedAt DateTime @default(now()) @map("committed_at")
 
   owner UserSyncState @relation(fields: [subject], references: [subject], onDelete: Cascade)

@@ -18,7 +18,6 @@ describe("Rootline contracts", () => {
       AUTH_REQUIRED: "AUTH_REQUIRED",
       AUTH_CALLBACK_INVALID: "AUTH_CALLBACK_INVALID",
       PROFILE_CONFLICT: "PROFILE_CONFLICT",
-      SYNC_EPOCH_RESET_REQUIRED: "SYNC_EPOCH_RESET_REQUIRED",
       SYNC_ACCOUNT_CLAIM_REQUIRED: "SYNC_ACCOUNT_CLAIM_REQUIRED",
       SYNC_STATE_CHANGED: "SYNC_STATE_CHANGED",
       RATE_LIMITED: "RATE_LIMITED",
@@ -32,6 +31,7 @@ describe("Rootline contracts", () => {
       RESET_REQUIRED: "RESET_REQUIRED",
       SCHEMA_UNSUPPORTED: "SCHEMA_UNSUPPORTED",
     });
+    expect(contracts.ROOTLINE_ERROR_CODES).not.toHaveProperty("SYNC_EPOCH_RESET_REQUIRED");
 
     const error = contracts.createRootlineError({
       code: contracts.ROOTLINE_ERROR_CODES.PATH_OVERLAP,

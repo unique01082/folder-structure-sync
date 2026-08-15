@@ -435,7 +435,7 @@ export class DesktopAuthController implements AuthController {
       this.update(next);
     } catch (error) {
       const value = error as { code?: unknown; message?: unknown; details?: { epoch?: unknown; preservesConsentedOutbox?: unknown } };
-      if (value?.code === "SYNC_EPOCH_RESET_REQUIRED" && typeof value.details?.epoch === "string") {
+      if ((value?.code === "RESET_REQUIRED" || value?.code === "SYNC_EPOCH_RESET_REQUIRED") && typeof value.details?.epoch === "string") {
         this.resetEpoch = value.details.epoch;
         this.update({
           ...this.current,

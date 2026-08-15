@@ -1,5 +1,6 @@
 import { BadRequestException, ConflictException, Inject, Injectable } from "@nestjs/common";
 import { Prisma } from "@prisma/client";
+import { ROOTLINE_ERROR_CODES } from "@rootline/contracts";
 import { createHash, randomUUID } from "node:crypto";
 
 import { PrismaService } from "./prisma.service.js";
@@ -41,7 +42,7 @@ function decodeCursor(cursor: string | undefined, epoch: string): bigint {
   try {
     const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as { epoch?: unknown; revision?: unknown };
     if (typeof value.epoch !== "string" || typeof value.revision !== "string" || !/^\d+$/.test(value.revision)) throw new Error();
-    if (value.epoch !== epoch) throw new ConflictException({ code: "SYNC_EPOCH_RESET_REQUIRED", epoch });
+    if (value.epoch !== epoch) throw new ConflictException({ code: ROOTLINE_ERROR_CODES.RESET_REQUIRED, epoch });
     return BigInt(value.revision);
   } catch (error) {
     if (error instanceof ConflictException) throw error;
@@ -169,7 +170,9 @@ export class SyncService {
       await tx.userSyncState.upsert({ where: { subject }, update: {}, create: { subject, epoch: request.epoch ?? randomUUID() } });
       await tx.$queryRaw`SELECT "subject" FROM "user_sync_state" WHERE "subject" = ${subject} FOR UPDATE`;
       const state = await tx.userSyncState.findUniqueOrThrow({ where: { subject } });
-      if (request.epoch !== null && state.epoch !== request.epoch) throw new ConflictException({ code: "SYNC_EPOCH_RESET_REQUIRED", epoch: state.epoch });
+      if (request.epoch !== null && state.epoch !== request.epoch) {
+        throw new ConflictException({ code: ROOTLINE_ERROR_CODES.RESET_REQUIRED, epoch: state.epoch });
+      }
       const requestedRevision = decodeCursor(request.cursor, state.epoch);
       if (requestedRevision > state.revision) throw new BadRequestException("Cursor revision is ahead of the server.");
       await tx.mutationReceipt.deleteMany({ where: { expiresAt: { lte: new Date() } } });
@@ -203,12 +206,12 @@ export class SyncService {
           create: {
             subject, profileId: mutation.kind === "upsert" ? mutation.profile!.id : mutation.profileId!, kind: mutation.kind === "upsert" ? "profile" : "tombstone",
             profile: mutation.kind === "upsert" ? json(mutation.profile) : retainedProfile ? json(retainedProfile) : Prisma.JsonNull,
-            deletedAt: mutation.kind === "delete" ? committedAt : null, revision, committedAt,
+            deletedAt: mutation.kind === "delete" ? committedAt : null, revision, lastDeviceId: request.deviceId, committedAt,
           },
           update: {
             kind: mutation.kind === "upsert" ? "profile" : "tombstone",
             profile: mutation.kind === "upsert" ? json(mutation.profile) : retainedProfile ? json(retainedProfile) : Prisma.JsonNull,
-            deletedAt: mutation.kind === "delete" ? committedAt : null, revision, committedAt,
+            deletedAt: mutation.kind === "delete" ? committedAt : null, revision, lastDeviceId: request.deviceId, committedAt,
           },
         });
         await tx.syncChange.create({ data: { subject, revision, record: json(record), committedAt } });
@@ -253,7 +256,9 @@ export class SyncService {
       await tx.userSyncState.upsert({ where: { subject }, update: {}, create: { subject, epoch: dto.epoch } });
       await tx.$queryRaw`SELECT "subject" FROM "user_sync_state" WHERE "subject" = ${subject} FOR UPDATE`;
       const state = await tx.userSyncState.findUniqueOrThrow({ where: { subject } });
-      if (state.epoch !== dto.epoch) throw new ConflictException({ code: "SYNC_EPOCH_RESET_REQUIRED", epoch: state.epoch });
+      if (state.epoch !== dto.epoch) {
+        throw new ConflictException({ code: ROOTLINE_ERROR_CODES.RESET_REQUIRED, epoch: state.epoch });
+      }
       const epoch = randomUUID();
       await tx.profileRecord.deleteMany({ where: { subject } });
       await tx.syncChange.deleteMany({ where: { subject } });

@@ -9,6 +9,8 @@ export interface DiffTreeLabels {
   selected: string;
   clear: string;
   selectAllMissing: string;
+  expandAll: string;
+  collapseAll: string;
   folderDifferences: string;
   folderFilter: string;
   status: Record<DiffStatus, string>;
@@ -175,6 +177,8 @@ export const DiffTree = memo(function DiffTree({ entries, selected, onSelectionC
           <button type="button" aria-pressed={filter === "all"} onClick={() => setFilter("all")}>{labels.all}</button>
           <button type="button" aria-pressed={filter === "selected"} onClick={() => setFilter("selected")}>{labels.selected}</button>
         </div>
+        <button className="quiet-button" type="button" onClick={() => setExpanded(new Set(parents))}>{labels.expandAll}</button>
+        <button className="quiet-button" type="button" onClick={() => setExpanded(new Set())}>{labels.collapseAll}</button>
         <button className="quiet-button" type="button" onClick={() => onSelectionChange(new Set())}>{labels.clear}</button>
         <button className="quiet-button" type="button" onClick={() => onSelectionChange(new Set(missingPaths))}>{labels.selectAllMissing}</button>
       </div>

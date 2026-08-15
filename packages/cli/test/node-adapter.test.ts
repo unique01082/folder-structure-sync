@@ -52,6 +52,22 @@ describe("Node filesystem adapter", () => {
     expect(scan.skippedSymlinks).toEqual(["linked"]);
   });
 
+  it.runIf(process.platform === "win32")("skips Windows junctions and rejects a junction root", async () => {
+    const root = await tempDirectory();
+    const target = await tempDirectory();
+    const outside = await tempDirectory();
+    const junction = join(root, "junction");
+    await mkdir(join(outside, "secret"));
+    await symlink(outside, junction, "junction");
+    const adapter = new NodeFileSystemAdapter();
+
+    const scan = await adapter.scanDirectories(root, []);
+
+    expect(scan.snapshot.entries).toEqual([]);
+    expect(scan.skippedSymlinks).toEqual(["junction"]);
+    await expect(adapter.validateRootPaths(junction, target)).rejects.toMatchObject({ code: "INVALID_PATH" });
+  });
+
   it("honors legacy .ignore pruning and maps non-directory roots to unreadable errors", async () => {
     const root = await tempDirectory();
     const file = join(root, "file");

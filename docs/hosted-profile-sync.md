@@ -10,6 +10,7 @@ Production registration is an external deployment gate. Create an Authentik OAut
 
 | Setting | Required value |
 |---------|----------------|
+| **Application slug** | `rootline` |
 | **Client type** | Public |
 | **Grant** | Authorization Code with PKCE |
 | **Redirect URI** | `rootline://auth/callback` |
@@ -73,9 +74,9 @@ The stable deployment must provide TLS termination for the API, TLS validation f
 
 Both account endpoints require an RS256 token with the configured issuer, audience, subject, and `rootline:profiles:sync` permission. Tenant ownership always comes from the verified `sub`; request bodies cannot select another tenant. Requests are limited to 256 KiB, 100 mutations, and 60 authenticated requests per user per rolling minute. Profile names contain 1–80 characters, source and target paths contain 1–4096 characters, and exclusions contain at most 100 patterns of 1–256 characters each. The shared contract, API DTO, desktop editor, and native persistence boundary enforce these same limits.
 
-The built-in rolling limiter is process-local. Run one API replica for this version. Horizontal scaling requires a shared, subject-keyed limiter before adding replicas; an ingress-only IP limit is not equivalent to the per-user contract.
+The built-in rolling limiter is process-local. Run one API replica for this version. Horizontal scaling requires a shared, subject-keyed limiter before adding replicas; an ingress-only IP limit is not equivalent to the per-user contract. Every committed profile/tombstone also records the last device ID that submitted it, without logging profile paths.
 
-Server commit arrival order is last-write-wins. Every new mutation advances a per-user revision and deletes become tombstones. Mutation receipt rows are physically retained for 90 days and purged opportunistically during a later sync, while a compact content-bound deduplication record remains for the lifetime of the account epoch. Replaying the same mutation ID and payload after receipt expiry therefore acknowledges its original revision without another write; reusing the ID with different content returns 409. Account deletion clears profiles, tombstones, changes, receipts, and deduplication records, then rotates the epoch. A stale device receives `SYNC_EPOCH_RESET_REQUIRED` and cannot silently resurrect deleted data.
+Server commit arrival order is last-write-wins. Every new mutation advances a per-user revision and deletes become tombstones. Mutation receipt rows are physically retained for 90 days and purged opportunistically during a later sync, while a compact content-bound deduplication record remains for the lifetime of the account epoch. Replaying the same mutation ID and payload after receipt expiry therefore acknowledges its original revision without another write; reusing the ID with different content returns 409. Account deletion clears profiles, tombstones, changes, receipts, and deduplication records, then rotates the epoch. A stale device receives `RESET_REQUIRED` and cannot silently resurrect deleted data; clients still recognize the pre-release `SYNC_EPOCH_RESET_REQUIRED` spelling during upgrades.
 
 Mutation IDs are bound to a canonical content hash; reuse with different content returns 409 instead of silently dropping a change. Delta pages contain at most 100 records and approximately 1 MiB of record JSON. `hasMore` and the returned cursor let the desktop drain long-offline deltas while enforcing a 2 MiB streaming response cap.
 

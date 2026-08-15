@@ -32,6 +32,7 @@ const plan: ScanPlan = {
 function gateway(overrides: Partial<NativeGateway> = {}): NativeGateway {
   return {
     chooseFolder: vi.fn(async ({ role }) => role === "source" ? "/projects/source" : "/projects/target"),
+    inspectProfileRoots: vi.fn(async () => ({ sourceAvailable: true, targetAvailable: true })),
     scan: vi.fn(async () => plan),
     apply: vi.fn(async () => ({
       runId: "run-1",
@@ -99,6 +100,27 @@ describe("Rootline desktop workflow", () => {
     await user.click(screen.getByRole("button", { name: "Scan differences" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Choose a new source folder");
     expect(screen.getByRole("button", { name: "Rebind source" })).toBeInTheDocument();
+  });
+
+  test("marks unavailable saved roots for rebind as soon as a profile is selected", async () => {
+    const user = userEvent.setup();
+    const profile = {
+      id: "detached", name: "Detached", sourcePath: "/missing/source", targetPath: "/missing/target",
+      exclusions: [], createdAt: "x", updatedAt: "x",
+    };
+    const inspectProfileRoots = vi.fn(async () => ({ sourceAvailable: false, targetAvailable: false }));
+    const native = gateway({
+      listProfiles: vi.fn(async () => [profile]),
+      inspectProfileRoots,
+    } as Partial<NativeGateway>);
+    render(<App gateway={native} />);
+
+    await user.click(await screen.findByRole("option", { name: "Detached" }));
+
+    expect(await screen.findByRole("button", { name: "Rebind source" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Rebind target" })).toBeInTheDocument();
+    expect(inspectProfileRoots).toHaveBeenCalledWith({ sourcePath: profile.sourcePath, targetPath: profile.targetPath });
+    expect(native.scan).not.toHaveBeenCalled();
   });
 
   test("supports keyboard profile navigation, restores focus, Vietnamese copy, and has no serious axe violations", async () => {
@@ -370,5 +392,16 @@ describe("DiffTree virtualization", () => {
     expect(docs).toHaveFocus();
     await user.keyboard("{End}");
     expect(screen.getByRole("treeitem", { name: "src" })).toHaveFocus();
+  });
+
+  test("provides explicit localized controls to collapse and expand the whole tree", async () => {
+    const user = userEvent.setup();
+    const entries = ["docs", "docs/api", "src"].map((relativePath) => ({ relativePath, status: "missing" as const }));
+    render(<DiffTree entries={entries} selected={new Set()} onSelectionChange={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: "Collapse all" }));
+    expect(screen.queryByRole("treeitem", { name: "docs/api" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Expand all" }));
+    expect(screen.getByRole("treeitem", { name: "docs/api" })).toBeInTheDocument();
   });
 });

@@ -157,6 +157,16 @@ describe("Rootline hosted sync (real PostgreSQL)", () => {
       profiles: [{ ...profile, revision: "1" }],
     });
     expect(created.body).toMatchObject({ epoch: created.body.accountEpoch, receipts: [{ mutationId }] });
+    const deviceColumns = await postgres.$queryRaw<Array<{ column_name: string }>>`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'profile_record' AND column_name = 'last_device_id'
+    `;
+    expect(deviceColumns).toEqual([{ column_name: "last_device_id" }]);
+    const storedDevice = await postgres.$queryRaw<Array<{ last_device_id: string }>>`
+      SELECT last_device_id FROM profile_record
+      WHERE subject = 'public-contract-user' AND profile_id = 'public-profile'
+    `;
+    expect(storedDevice).toEqual([{ last_device_id: "public-device" }]);
     await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${auth}`)
       .send({
         deviceId: "public-device",
@@ -304,7 +314,7 @@ describe("Rootline hosted sync (real PostgreSQL)", () => {
     expect(deleted.body.epoch).not.toBe(EPOCH);
     const stale = await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${auth}`)
       .send({ deviceId: "stale-device", epoch: EPOCH, mutations: [mutation(PROFILE_ID, "Must not return", "00000000-0000-4000-8000-000000000402")] }).expect(409);
-    expect(stale.body).toEqual(expect.objectContaining({ code: "SYNC_EPOCH_RESET_REQUIRED", epoch: deleted.body.epoch }));
+    expect(stale.body).toEqual(expect.objectContaining({ code: "RESET_REQUIRED", epoch: deleted.body.epoch }));
     const current = await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${auth}`)
       .send({ deviceId: "fresh-device", epoch: deleted.body.epoch, mutations: [] }).expect(200);
     expect(current.body.records).toEqual([]);

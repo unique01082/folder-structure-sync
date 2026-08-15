@@ -1,9 +1,9 @@
 use std::fs;
 
 use rootline_desktop::{
-    apply_plan, detect_case_sensitive, random_vault_password, resolve_existing_vault_password,
-    scan_plan, CancellationToken, Database, DiffStatus, DirectoryStatus, NativeErrorCode, Profile,
-    ScanRequest,
+    apply_plan, detect_case_sensitive, inspect_profile_roots, random_vault_password,
+    resolve_existing_vault_password, scan_plan, CancellationToken, Database, DiffStatus,
+    DirectoryStatus, NativeErrorCode, Profile, ScanRequest,
 };
 use rusqlite::Connection;
 use tempfile::tempdir;
@@ -15,6 +15,23 @@ fn request(source: &std::path::Path, target: &std::path::Path) -> ScanRequest {
         target_path: target.to_path_buf(),
         exclusions: vec![".git".into()],
     }
+}
+
+#[test]
+fn saved_profile_root_inspection_is_read_only_and_reports_each_missing_root() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("source");
+    let target = directory.path().join("target");
+    fs::create_dir(&source).unwrap();
+    let sentinel = source.join("sentinel");
+    fs::write(&sentinel, "unchanged").unwrap();
+
+    let availability = inspect_profile_roots(&source, &target).unwrap();
+
+    assert!(availability.source_available);
+    assert!(!availability.target_available);
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "unchanged");
+    assert!(!target.exists());
 }
 
 fn create_v5_database_with_invalid_profile(path: &std::path::Path, profile: &Profile) {
@@ -395,6 +412,44 @@ fn skips_symbolic_links_instead_of_following_them() {
     assert_eq!(
         scan_plan(
             &request(&linked_ancestor.join("source"), target.path()),
+            &CancellationToken::default(),
+        )
+        .unwrap_err()
+        .code,
+        NativeErrorCode::InvalidPath,
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn skips_windows_junctions_and_rejects_a_junction_root() {
+    use std::process::Command;
+
+    let source = tempdir().unwrap();
+    let target = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    fs::create_dir(outside.path().join("secret")).unwrap();
+    let junction = source.path().join("junction");
+    let status = Command::new("cmd.exe")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(&junction)
+        .arg(outside.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let plan = scan_plan(
+        &request(source.path(), target.path()),
+        &CancellationToken::default(),
+    )
+    .unwrap();
+    assert!(plan.missing.is_empty());
+    assert_eq!(plan.skipped_links, ["junction"]);
+    assert_eq!(
+        scan_plan(
+            &request(&junction, target.path()),
             &CancellationToken::default(),
         )
         .unwrap_err()

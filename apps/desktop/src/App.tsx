@@ -16,7 +16,12 @@ import {
 } from "./native";
 
 type Step = "choose" | "scanning" | "review" | "applying" | "result";
-type RebindRole = "source" | "target" | null;
+interface RebindState {
+  source: boolean;
+  target: boolean;
+}
+
+const noRebind: RebindState = { source: false, target: false };
 
 interface AppProps {
   gateway?: NativeGateway;
@@ -47,6 +52,7 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
   const text = copy[locale];
   const [profiles, setProfiles] = useState<Profile[]>(initialProfile ? [initialProfile] : []);
   const [activeProfile, setActiveProfile] = useState<Profile | undefined>(initialProfile);
+  const activeProfileRef = useRef<Profile | undefined>(initialProfile);
   const [profileName, setProfileName] = useState(initialProfile?.name ?? "");
   const [sourcePath, setSourcePath] = useState(initialProfile?.sourcePath ?? "");
   const [targetPath, setTargetPath] = useState(initialProfile?.targetPath ?? "");
@@ -55,7 +61,7 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [result, setResult] = useState<ApplyResult>();
   const [error, setError] = useState<string>();
-  const [rebind, setRebind] = useState<RebindRole>(null);
+  const [rebind, setRebind] = useState<RebindState>(noRebind);
   const [activeOperation, setActiveOperation] = useState<string>();
   const [deleteCandidate, setDeleteCandidate] = useState<Profile>();
   const headingRef = useRef<HTMLHeadingElement>(null);
@@ -65,28 +71,43 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
   const deleteCancelRef = useRef<HTMLButtonElement>(null);
   const deleteReturnFocusRef = useRef<HTMLElement | null>(null);
   const returnToScanRef = useRef(false);
+  const profileInspectionRef = useRef(0);
   const profileNameId = useId();
   const deleteDialogTitleId = useId();
 
+  const inspectSavedProfile = (profile: Profile): void => {
+    const inspection = ++profileInspectionRef.current;
+    setRebind(noRebind);
+    void gateway.inspectProfileRoots({ sourcePath: profile.sourcePath, targetPath: profile.targetPath }).then((availability) => {
+      if (profileInspectionRef.current !== inspection) return;
+      setRebind({ source: !availability.sourceAvailable, target: !availability.targetAvailable });
+    }).catch(() => {
+      if (profileInspectionRef.current === inspection) setRebind({ source: true, target: true });
+    });
+  };
+
   const reconcileProfiles = (loaded: Profile[]): void => {
     setProfiles(loaded);
-    setActiveProfile((current) => {
-      if (!current) return undefined;
-      const replacement = loaded.find((profile) => profile.id === current.id);
-      if (replacement) {
-        setProfileName(replacement.name);
-        setSourcePath(replacement.sourcePath);
-        setTargetPath(replacement.targetPath);
-      } else {
-        setProfileName("");
-        setSourcePath("");
-        setTargetPath("");
-        setPlan(undefined);
-        setResult(undefined);
-        setStep("choose");
-      }
-      return replacement;
-    });
+    const current = activeProfileRef.current;
+    if (!current) return;
+    const replacement = loaded.find((profile) => profile.id === current.id);
+    activeProfileRef.current = replacement;
+    setActiveProfile(replacement);
+    if (replacement) {
+      setProfileName(replacement.name);
+      setSourcePath(replacement.sourcePath);
+      setTargetPath(replacement.targetPath);
+      inspectSavedProfile(replacement);
+    } else {
+      profileInspectionRef.current += 1;
+      setProfileName("");
+      setSourcePath("");
+      setTargetPath("");
+      setPlan(undefined);
+      setResult(undefined);
+      setRebind(noRebind);
+      setStep("choose");
+    }
   };
 
   useEffect(() => {
@@ -98,6 +119,10 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
       // A first-run database failure is surfaced when the user saves; choosing folders still works.
     });
     return () => { live = false; };
+  }, [gateway, initialProfile]);
+
+  useEffect(() => {
+    if (initialProfile) inspectSavedProfile(initialProfile);
   }, [gateway, initialProfile]);
 
   useEffect(() => {
@@ -145,9 +170,10 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
   const choose = async (role: "source" | "target"): Promise<void> => {
     const path = await gateway.chooseFolder({ role });
     if (!path) return;
+    profileInspectionRef.current += 1;
     if (role === "source") setSourcePath(path);
     else setTargetPath(path);
-    setRebind(null);
+    setRebind((current) => ({ ...current, [role]: false }));
     setError(undefined);
     setStep("choose");
   };
@@ -161,8 +187,9 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
 
   const scan = async (): Promise<void> => {
     const id = operationId("scan");
+    profileInspectionRef.current += 1;
     setError(undefined);
-    setRebind(null);
+    setRebind(noRebind);
     setActiveOperation(id);
     setStep("scanning");
     try {
@@ -176,11 +203,11 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
         returnToScanRef.current = true;
         setStep("choose");
       } else if (failure.code === "SOURCE_NOT_FOUND") {
-        setRebind("source");
+        setRebind((current) => ({ ...current, source: true }));
         setError(text.sourceMissing);
         setStep("choose");
       } else if (failure.code === "TARGET_NOT_FOUND") {
-        setRebind("target");
+        setRebind((current) => ({ ...current, target: true }));
         setError(text.targetMissing);
         setStep("choose");
       } else {
@@ -227,6 +254,7 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
   };
 
   const selectProfile = (profile: Profile): void => {
+    activeProfileRef.current = profile;
     setActiveProfile(profile);
     setProfileName(profile.name);
     setSourcePath(profile.sourcePath);
@@ -235,6 +263,7 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
     setResult(undefined);
     setError(undefined);
     setStep("choose");
+    inspectSavedProfile(profile);
   };
 
   const requestProfileDelete = (profile: Profile, returnFocus: HTMLElement): void => {
@@ -283,12 +312,15 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
   };
 
   const newProfile = (): void => {
+    profileInspectionRef.current += 1;
+    activeProfileRef.current = undefined;
     setActiveProfile(undefined);
     setProfileName("");
     setSourcePath("");
     setTargetPath("");
     setPlan(undefined);
     setResult(undefined);
+    setRebind(noRebind);
     setStep("choose");
   };
 
@@ -313,6 +345,7 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
       const saved = await gateway.saveProfile(profile);
       setProfiles((current) => [saved, ...current.filter((entry) => entry.id !== saved.id)]);
       setActiveProfile(saved);
+      activeProfileRef.current = saved;
       setProfileName(saved.name);
       syncCoordinator?.profileEdited();
     } catch (unknownError) {
@@ -328,13 +361,15 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
       await gateway.deleteProfile(deletedId);
       setProfiles((current) => current.filter((profile) => profile.id !== deletedId));
       if (activeProfile?.id === deletedId) {
+        activeProfileRef.current = undefined;
         setActiveProfile(undefined);
         setProfileName("");
         setSourcePath("");
         setTargetPath("");
         setPlan(undefined);
         setResult(undefined);
-        setRebind(null);
+        profileInspectionRef.current += 1;
+        setRebind(noRebind);
         setStep("choose");
       }
       setDeleteCandidate(undefined);
@@ -417,14 +452,14 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
               <p className="lede">{text.chooseBody}</p>
               {error ? <div className="error-card" role="alert"><span aria-hidden="true">!</span><p>{error}</p></div> : null}
               <div className="root-pair">
-                <article className={rebind === "source" ? "root-card needs-rebind" : "root-card"}>
+                <article className={rebind.source ? "root-card needs-rebind" : "root-card"}>
                   <span className="root-number">01</span><div className="root-copy"><small>{text.source}</small><strong>{sourcePath || text.notChosen}</strong></div>
-                  <button type="button" onClick={() => void choose("source")}>{rebind === "source" ? text.rebindSource : text.chooseSource}</button>
+                  <button type="button" onClick={() => void choose("source")}>{rebind.source ? text.rebindSource : text.chooseSource}</button>
                 </article>
                 <div className="flow-arrow" aria-hidden="true">→</div>
-                <article className={rebind === "target" ? "root-card needs-rebind" : "root-card"}>
+                <article className={rebind.target ? "root-card needs-rebind" : "root-card"}>
                   <span className="root-number">02</span><div className="root-copy"><small>{text.target}</small><strong>{targetPath || text.notChosen}</strong></div>
-                  <button type="button" onClick={() => void choose("target")}>{rebind === "target" ? text.rebindTarget : text.chooseTarget}</button>
+                  <button type="button" onClick={() => void choose("target")}>{rebind.target ? text.rebindTarget : text.chooseTarget}</button>
                 </article>
               </div>
               <div className="profile-save">

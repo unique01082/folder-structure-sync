@@ -30,7 +30,7 @@ pub enum NativeErrorCode {
     StalePlan,
     AuthRequired,
     AuthCallbackInvalid,
-    SyncEpochResetRequired,
+    ResetRequired,
     SyncAccountClaimRequired,
     SyncStateChanged,
     ValidationFailed,
@@ -207,6 +207,13 @@ pub struct DiffEntry {
     pub status: DiffStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileRootAvailability {
+    pub source_available: bool,
+    pub target_available: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectoryResult {
@@ -313,6 +320,37 @@ fn assert_no_link_ancestors(path: &Path) -> Result<(), NativeError> {
         }
     }
     Ok(())
+}
+
+fn profile_root_available(path: &Path) -> Result<bool, NativeError> {
+    let absolute = absolute(path)?;
+    if assert_no_link_ancestors(&absolute).is_err() {
+        return Ok(false);
+    }
+    match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => Ok(metadata.is_dir() && !is_link_or_junction(&metadata)),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(NativeError::at(
+            NativeErrorCode::UnreadablePath,
+            error.to_string(),
+            &absolute,
+        )),
+    }
+}
+
+pub fn inspect_profile_roots(
+    source_path: &Path,
+    target_path: &Path,
+) -> Result<ProfileRootAvailability, NativeError> {
+    Ok(ProfileRootAvailability {
+        source_available: profile_root_available(source_path)?,
+        target_available: profile_root_available(target_path)?,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -2483,6 +2521,14 @@ fn choose_folder(_role: String) -> Option<String> {
 }
 
 #[tauri::command]
+fn inspect_saved_profile_roots(
+    source_path: PathBuf,
+    target_path: PathBuf,
+) -> Result<ProfileRootAvailability, NativeError> {
+    inspect_profile_roots(&source_path, &target_path)
+}
+
+#[tauri::command]
 async fn scan_directories(
     request: ScanRequest,
     operations: State<'_, Arc<OperationRegistry>>,
@@ -2674,12 +2720,14 @@ where
             ));
         }
         if status == reqwest::StatusCode::CONFLICT
-            && body.get("code").and_then(serde_json::Value::as_str)
-                == Some("SYNC_EPOCH_RESET_REQUIRED")
+            && body
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|code| code == "RESET_REQUIRED" || code == "SYNC_EPOCH_RESET_REQUIRED")
         {
             let preserves_consented_outbox = database.preserves_consented_outbox(subject)?;
             return Err(NativeError {
-                code: NativeErrorCode::SyncEpochResetRequired,
+                code: NativeErrorCode::ResetRequired,
                 message: if preserves_consented_outbox {
                     "This account already has hosted data. Review the explicitly consented local profiles before uploading."
                 } else {
@@ -2891,7 +2939,7 @@ fn accept_hosted_epoch(
 ) -> Result<(), NativeError> {
     if subject.is_empty() || Uuid::parse_str(&epoch).is_err() {
         return Err(NativeError::new(
-            NativeErrorCode::SyncEpochResetRequired,
+            NativeErrorCode::ResetRequired,
             "Hosted sync returned an invalid account reset.",
         ));
     }
@@ -3017,6 +3065,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             choose_folder,
+            inspect_saved_profile_roots,
             scan_directories,
             apply_directories,
             cancel_operation,
