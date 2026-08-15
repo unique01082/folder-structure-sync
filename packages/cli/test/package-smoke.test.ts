@@ -38,7 +38,7 @@ describe("published CLI package", () => {
     const target = join(scratch, "target");
     await Promise.all([mkdir(install), mkdir(join(source, "nested"), { recursive: true })]);
     const tarball = join(scratch, "folder-structure-sync-2.0.0.tgz");
-    const listing = execute("tar", ["-tzf", tarball]).stdout.split("\n");
+    const listing = execute("tar", ["-tzf", tarball]).stdout.split(/\r?\n/);
     expect(listing).toEqual(expect.arrayContaining(["package/LICENSE", "package/README.md"]));
     execute("tar", ["-xzf", tarball, "-C", scratch, "package/package.json"]);
     const packedManifest = JSON.parse(await readFile(join(scratch, "package", "package.json"), "utf8"));
