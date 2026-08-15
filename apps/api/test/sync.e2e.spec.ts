@@ -185,6 +185,25 @@ describe("Rootline hosted sync (real PostgreSQL)", () => {
           profile: { ...profile, syncMode: "additive" },
         }],
       }).expect(400);
+    const privacyLog = vi.spyOn(Logger.prototype, "error");
+    await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${auth}`)
+      .send({
+        deviceId: "public-device",
+        accountEpoch: created.body.accountEpoch,
+        cursor: created.body.cursor,
+        mutations: [{
+          mutationId: "00000000-0000-4000-8000-000000000208",
+          type: "upsert",
+          profile: {
+            ...profile,
+            sourcePath: "/private/secret-source-that-must-not-be-logged",
+            directoryTree: ["private", "secret"],
+            runHistory: [{ result: "created" }],
+          },
+        }],
+      }).expect(400);
+    expect(privacyLog).not.toHaveBeenCalled();
+    privacyLog.mockRestore();
 
     const deleteMutationId = "00000000-0000-4000-8000-000000000206";
     const deleted = await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${auth}`)

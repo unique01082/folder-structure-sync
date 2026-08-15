@@ -34,11 +34,40 @@ afterEach(async () => {
 });
 
 describe("folder-sync command", () => {
+  it("prints help with every legacy and v2 flag", () => {
+    const result = run("--help");
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    for (const flag of ["--dry-run", "--verbose", "--auto", "--config <path>", "--json"]) {
+      expect(result.stdout).toContain(flag);
+    }
+  });
+
   it("reads --version from the package metadata", () => {
     const result = run("--version");
 
     expect(result.status).toBe(0);
     expect(result.stdout.trim()).toBe("2.0.0");
+  });
+
+  it("previews a missing target in JSON dry-run mode without creating it or emitting terminal decoration", async () => {
+    const workspace = await tempDirectory();
+    const source = join(workspace, "source");
+    const target = join(workspace, "target");
+    await mkdir(join(source, "docs", "api"), { recursive: true });
+
+    const result = run(source, target, "--dry-run", "--json");
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).not.toContain(String.fromCharCode(27));
+    expect(result.stdout).not.toMatch(/progress|spinner/i);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      target: { status: "would-create" },
+      plan: { missing: ["docs", "docs/api"] },
+    });
+    await expect(lstat(target)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("creates a missing target in auto JSON mode without prompting", async () => {

@@ -37,9 +37,6 @@
         "schemes": ["rootline"]
       }
     },
-    "opener": {
-      "openUrl": true
-    },
     "updater": {
       "endpoints": [
         "https://github.com/unique01082/folder-structure-sync/releases/latest/download/latest.json"
