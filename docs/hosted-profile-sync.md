@@ -41,7 +41,7 @@ Native sync calls are serialized. Each request captures the verified subject plu
 The API requires:
 
 ```dotenv
-DATABASE_URL=postgresql://rootline:REDACTED@postgres.example.com:5432/rootline?sslmode=require
+DATABASE_URL=postgresql://rootline:REDACTED@postgres.example.com:5432/rootline?sslmode=require&sslaccept=strict
 JWT_ISSUER=https://auth.example.com/application/o/rootline/
 JWT_AUDIENCE=rootline-desktop
 JWT_JWKS_PATH=/run/secrets/rootline-authentik-jwks.json
@@ -65,7 +65,7 @@ The stable deployment must provide TLS termination for the API, TLS validation f
 
 | Endpoint | Contract |
 |----------|----------|
-| **`GET /healthz`** | Public liveness response; no account data |
+| **`GET /healthz`** | Public liveness plus non-sensitive deployment build identity; no account data |
 | **`POST /v1/sync`** | Authenticated profile mutations and cursor delta |
 | **`DELETE /v1/account-data`** | Deletes hosted data and rotates the user's epoch |
 
@@ -106,4 +106,6 @@ The API suite includes a real seam test that starts from the desktop's SQLite pr
 ## Related
 
 - [Rootline documentation](README.md) - Documentation navigation.
+- [Configuration](configuration.md) - Desktop and API environment variables.
+- [Operations](operations.md) - Production rollout, backups, and incident handling.
 - [Rootline Desktop + CLI v2 implementation plan](superpowers/plans/2026-08-15-rootline-desktop-cli-v2.md) - Product constraints and acceptance criteria.

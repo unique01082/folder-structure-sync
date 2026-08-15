@@ -5,13 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.0.0] - Unreleased
 
 ### Added
 
-- Initial release preparation
-- GitHub repository setup
-- Comprehensive documentation
+- Rootline Desktop for macOS Universal and Windows x64/ARM64.
+- A shared, deterministic additive-sync core and the `folder-sync` Node.js 20 CLI.
+- Optional Authentik-hosted profile sync backed by PostgreSQL; local-only profiles remain the default.
+- Fail-closed CI and protected npm, API, desktop signing, notarization, and updater workflows.
+
+### Changed
+
+- The v2 CLI entry point is `folder-sync`; the root `node index.js` program is retained only as `1.x` migration evidence.
+- Stable distribution remains blocked until the documented production environments, credentials, signing identities, updater key, and reviewed `v2.0.0` tag exist and pass.
+
+## [1.1.0] - 2025-08-10
+
+### Preserved
+
+- Published npm behavior recovered byte-for-byte as migration evidence. See [the 1.1.0 recovery record](docs/baseline/npm-1.1.0-recovery.md) for registry integrity and provenance details.
 
 ## [1.0.0] - 2025-08-09
 

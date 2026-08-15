@@ -1,80 +1,19 @@
-# 🚀 Quick Reference - Publishing New Versions
+# Rootline release quick reference
 
-## ⚡ One-Command Publishing
+Stable Rootline releases are workflow-only and fail closed. Do not run `npm publish`, create a GitHub release, deploy the API, or sign installers from a local checkout.
 
-```bash
-# Bug fixes (1.0.0 → 1.0.1)
-npm run release:patch
+Use [the release runbook](docs/release.md) for the exact npm, API, and desktop gates. The runbook identifies the protected GitHub environments, required production configuration, validation sequence, and external credentials that currently block a real `2.0.0` release.
 
-# New features (1.0.0 → 1.1.0)
-npm run release:minor
-
-# Breaking changes (1.0.0 → 2.0.0)
-npm run release:major
-```
-
-Then: `npm publish`
-
-## 🔍 Pre-Flight Checks
+Local validation is safe and does not publish:
 
 ```bash
-# Run all checks
-npm run precheck
-
-# Test package functionality
-npm run test-package
-
-# Both checks + publish
-npm run publish:safe
+pnpm install --frozen-lockfile
+pnpm lint
+pnpm typecheck
+pnpm test
+pnpm build
+pnpm test:release
+pnpm validate:workflows
 ```
 
-## 📊 Post-Release Tools
-
-```bash
-# Package stats
-npm run workflow:stats
-
-# Social media posts
-npm run workflow:social
-
-# Promotion checklist
-npm run workflow:promotion
-
-# Command reference
-npm run workflow:commands
-```
-
-## 🎯 Release Workflow
-
-1. **Prepare** → `npm run precheck`
-2. **Release** → `npm run release:minor`
-3. **Publish** → `npm publish`
-4. **Promote** → `npm run workflow:social`
-
-## 🆘 Emergency Commands
-
-```bash
-# Check what will be published
-npm pack --dry-run
-
-# Verify npm login
-npm whoami
-
-# Check package on npm
-npm view folder-structure-sync
-
-# Test installation
-npx folder-structure-sync@latest --help
-```
-
-## 📁 Files Created
-
-- `scripts/release.js` - Automated release process
-- `scripts/pre-publish-check.js` - Pre-flight validation
-- `scripts/test-package.js` - Package functionality testing
-- `scripts/workflow.js` - Workflow automation helpers
-- `PUBLISHING.md` - Detailed publishing guide
-
-## 🎉 Ready to Ship!
-
-Your package is now equipped with professional release automation. Just run the commands and follow the prompts!
+Rootline `2.0.0` must not be described as shipped until every protected workflow completes from the reviewed `v2.0.0` tag.

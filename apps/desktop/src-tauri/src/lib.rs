@@ -2041,6 +2041,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let directory = app.path().app_data_dir()?;
             fs::create_dir_all(&directory)?;

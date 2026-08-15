@@ -46,4 +46,5 @@ In the recovered `1.1.0` source, recursive scanning checks for a `.ignore` file 
 ## Related
 
 - [Rootline documentation](../README.md) - Documentation navigation.
+- [Migration to 2.0.0](../migration-v1-to-v2.md) - Safe user upgrade sequence.
 - [Rootline Desktop + CLI v2 implementation plan](../superpowers/plans/2026-08-15-rootline-desktop-cli-v2.md) - The migration plan this evidence supports.

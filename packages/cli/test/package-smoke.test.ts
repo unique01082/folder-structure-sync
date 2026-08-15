@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,24 +25,29 @@ afterAll(async () => {
 });
 
 describe("published CLI package", () => {
-  it("installs from packed workspace tarballs and runs the folder-sync binary", async () => {
+  it("installs from the public CLI tarball alone and runs the folder-sync binary", async () => {
     execute("pnpm", ["--filter", "@rootline/contracts", "build"]);
     execute("pnpm", ["--filter", "@rootline/core", "build"]);
     execute("pnpm", ["--filter", "folder-structure-sync", "build"]);
-    execute("pnpm", ["--filter", "@rootline/contracts", "pack", "--pack-destination", scratch]);
-    execute("pnpm", ["--filter", "@rootline/core", "pack", "--pack-destination", scratch]);
     execute("pnpm", ["--filter", "folder-structure-sync", "pack", "--pack-destination", scratch]);
 
     const install = join(scratch, "install");
     const source = join(scratch, "source");
     const target = join(scratch, "target");
     await Promise.all([mkdir(install), mkdir(join(source, "nested"), { recursive: true })]);
-    const tarballs = [
-      join(scratch, "rootline-contracts-2.0.0.tgz"),
-      join(scratch, "rootline-core-2.0.0.tgz"),
-      join(scratch, "folder-structure-sync-2.0.0.tgz"),
-    ];
-    execute("npm", ["install", "--ignore-scripts", ...tarballs], install);
+    const tarball = join(scratch, "folder-structure-sync-2.0.0.tgz");
+    const listing = execute("tar", ["-tzf", tarball]).stdout.split("\n");
+    expect(listing).toEqual(expect.arrayContaining(["package/LICENSE", "package/README.md"]));
+    execute("tar", ["-xzf", tarball, "-C", scratch, "package/package.json"]);
+    const packedManifest = JSON.parse(await readFile(join(scratch, "package", "package.json"), "utf8"));
+    expect(packedManifest).toMatchObject({
+      engines: { node: ">=20" },
+      repository: {
+        type: "git",
+        url: "git+https://github.com/unique01082/folder-structure-sync.git",
+      },
+    });
+    execute("npm", ["install", "--ignore-scripts", tarball], install);
 
     const result = execute(join(install, "node_modules", ".bin", "folder-sync"), [source, target, "--auto", "--json"], install);
     expect(JSON.parse(result.stdout)).toMatchObject({ target: { status: "created" } });

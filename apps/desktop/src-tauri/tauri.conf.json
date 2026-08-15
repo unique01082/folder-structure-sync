@@ -25,6 +25,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": "all",
     "icon": [],
     "category": "Utility",
@@ -38,6 +39,12 @@
     },
     "opener": {
       "openUrl": true
+    },
+    "updater": {
+      "endpoints": [
+        "https://github.com/unique01082/folder-structure-sync/releases/latest/download/latest.json"
+      ],
+      "pubkey": ""
     }
   }
 }

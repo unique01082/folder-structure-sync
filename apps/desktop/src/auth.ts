@@ -12,7 +12,6 @@ import {
   type IWindow,
   type NavigateParams,
   type NavigateResponse,
-  type User,
   type UserManagerSettings,
 } from "oidc-client-ts";
 

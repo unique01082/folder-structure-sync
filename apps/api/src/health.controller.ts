@@ -9,5 +9,5 @@ export class HealthController {
   @Get("healthz")
   @ApiOperation({ summary: "Readiness/liveness probe" })
   @ApiResponse({ status: 200 })
-  health() { return { status: "ok" }; }
+  health() { return { status: "ok", buildId: process.env.ROOTLINE_BUILD_ID || "development" }; }
 }

@@ -84,7 +84,7 @@ describe("Rootline hosted sync (real PostgreSQL)", () => {
   }
 
   test("keeps health public and rejects wrong issuer, audience, or permission", async () => {
-    await request(fixture.server).get("/healthz").expect(200, { status: "ok" });
+    await request(fixture.server).get("/healthz").expect(200, { status: "ok", buildId: "development" });
     const body = { deviceId: "device-a", epoch: EPOCH, mutations: [] };
     await request(fixture.server).post("/v1/sync").send(body).expect(401);
     await request(fixture.server)
