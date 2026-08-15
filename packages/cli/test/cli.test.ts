@@ -24,6 +24,7 @@ beforeAll(() => {
   const build = spawnSync(pnpmCommand, ["--filter", "folder-structure-sync", "build"], {
     cwd: join(process.cwd(), "../.."),
     encoding: "utf8",
+    shell: process.platform === "win32",
   });
   if (build.status !== 0) {
     throw new Error(build.stderr || build.stdout);

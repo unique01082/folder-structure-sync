@@ -86,6 +86,7 @@ jobs:
         with:
           workspaces: apps/desktop/src-tauri
       - run: pnpm install --frozen-lockfile
+      - run: pnpm build:workspace-deps
       - run: pnpm --filter @rootline/api prisma:generate
       - run: pnpm --filter @rootline/api prisma:migrate:deploy
       - run: pnpm --filter @rootline/api test:e2e

@@ -13,14 +13,13 @@
     "build:workspace-deps": "pnpm --filter @rootline/contracts build && pnpm --filter @rootline/core build",
     "build": "pnpm -r --if-present run build",
     "lint": "eslint \"apps/**/*.{ts,tsx}\" \"packages/**/*.ts\" \"scripts/**/*.mjs\" \"tests/**/*.mjs\" --max-warnings 0",
-    "prepare": "pnpm build:workspace-deps",
     "test": "pnpm build:workspace-deps && pnpm -r --if-present run test",
     "test:api-image": "sh apps/api/scripts/test-docker-image.sh",
     "test:plan": "node --test tests/plan-acceptance.test.mjs",
     "test:unit": "pnpm build:workspace-deps && pnpm --filter @rootline/contracts test && pnpm --filter @rootline/core test && pnpm --filter folder-structure-sync test:unit && pnpm --filter @rootline/desktop test",
     "test:release": "node --test tests/*.test.mjs",
     "validate:workflows": "node --test tests/release-workflows.test.mjs",
-    "typecheck": "pnpm build:workspace-deps && pnpm -r --if-present run typecheck"
+    "typecheck": "pnpm build:workspace-deps && pnpm --filter @rootline/api prisma:generate && pnpm -r --if-present run typecheck"
   },
   "pnpm": {
     "overrides": {

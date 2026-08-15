@@ -105,6 +105,9 @@ test("CI covers TypeScript quality, real PostgreSQL, Rust, npm smoke, and the su
   ]) assert.match(ci, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   const postgresSteps = parsedWorkflow("ci.yml").jobs["postgres-integration"].steps;
   assert.ok(postgresSteps.some((step) => String(step.run ?? "").includes("libwebkit2gtk-4.1-dev")));
+  assert.ok(postgresSteps.some((step) => String(step.run ?? "").includes("build:workspace-deps")));
+  const tauriConfig = JSON.parse(readFileSync(join(root, "apps", "desktop", "src-tauri", "tauri.conf.json"), "utf8"));
+  assert.match(tauriConfig.build.beforeBuildCommand, /build:workspace-deps/);
   const tauriSteps = parsedWorkflow("ci.yml").jobs["tauri-build"].steps;
   const windowsTests = tauriSteps.find((step) => step.name === "Run Windows filesystem adapter tests");
   assert.equal(windowsTests?.if, "runner.os == 'Windows' && matrix.target == 'x86_64-pc-windows-msvc'");

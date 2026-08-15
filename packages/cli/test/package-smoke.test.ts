@@ -14,6 +14,7 @@ function execute(command: string, arguments_: string[], cwd = workspace) {
     cwd,
     encoding: "utf8",
     env: { ...process.env, npm_config_cache: join(scratch, "npm-cache") },
+    shell: process.platform === "win32",
   });
   if (result.status !== 0) {
     throw new Error(`${command} ${arguments_.join(" ")} failed:\n${result.stderr || result.stdout}`);
