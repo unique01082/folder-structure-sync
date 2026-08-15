@@ -1518,26 +1518,130 @@ impl Database {
             ));
         }
         let same_owner = owner.as_deref() == Some(subject);
-        if same_owner && !upload_existing {
+        let unresolved_claim: i64 = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM profile_sync_policy WHERE policy='unclaimed'
+               UNION ALL
+               SELECT 1
+               FROM mutation_quarantine quarantine
+               LEFT JOIN profile_sync_policy policy ON policy.profile_id=quarantine.profile_id
+               WHERE quarantine.provenance='pre-login'
+                 AND (policy.profile_id IS NULL OR policy.policy='unclaimed')
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if same_owner && !upload_existing && unresolved_claim == 0 {
             transaction.commit()?;
             return Ok(());
         }
         if !upload_existing {
-            transaction.execute("DELETE FROM mutation_outbox", [])?;
+            if same_owner {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO profile_sync_policy(profile_id, policy, subject)
+                     SELECT profile_id, 'unclaimed', '' FROM mutation_quarantine
+                     WHERE provenance='pre-login' AND profile_id<>''",
+                    [],
+                )?;
+                transaction.execute(
+                    "UPDATE profile_sync_policy SET policy='local-only', subject=?1
+                     WHERE policy='unclaimed'",
+                    [subject],
+                )?;
+                transaction.execute(
+                    "DELETE FROM mutation_outbox
+                     WHERE profile_id IN (
+                       SELECT profile_id FROM profile_sync_policy
+                       WHERE policy='local-only' AND subject=?1
+                     )",
+                    [subject],
+                )?;
+            } else {
+                transaction.execute(
+                    "INSERT OR REPLACE INTO profile_sync_policy(profile_id, policy, subject)
+                     SELECT id, 'local-only', ?1 FROM profiles",
+                    [subject],
+                )?;
+                transaction.execute(
+                    "INSERT OR REPLACE INTO profile_sync_policy(profile_id, policy, subject)
+                     SELECT profile_id, 'local-only', ?1 FROM mutation_outbox
+                     WHERE profile_id<>''",
+                    [subject],
+                )?;
+                transaction.execute(
+                    "INSERT OR REPLACE INTO profile_sync_policy(profile_id, policy, subject)
+                     SELECT profile_id, 'local-only', ?1 FROM mutation_quarantine
+                     WHERE profile_id<>''",
+                    [subject],
+                )?;
+                transaction.execute(
+                    "UPDATE profile_sync_policy SET policy='local-only', subject=?1
+                     WHERE policy='unclaimed'",
+                    [subject],
+                )?;
+                transaction.execute("DELETE FROM mutation_outbox", [])?;
+            }
             transaction.execute(
-                "UPDATE profile_sync_policy SET policy='local-only', subject=?1
-                 WHERE policy='unclaimed'",
+                "UPDATE mutation_quarantine SET subject=?1
+                 WHERE provenance='pre-login' AND profile_id IN (
+                   SELECT profile_id FROM profile_sync_policy
+                   WHERE policy='local-only' AND subject=?1
+                 )",
                 [subject],
             )?;
         } else {
+            if same_owner {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO profile_sync_policy(profile_id, policy, subject)
+                     SELECT profile_id, 'unclaimed', '' FROM mutation_quarantine
+                     WHERE provenance='pre-login' AND profile_id<>''",
+                    [],
+                )?;
+                transaction.execute(
+                    "UPDATE profile_sync_policy SET policy='consented', subject=?1
+                     WHERE policy='unclaimed' OR (policy='local-only' AND subject=?1)",
+                    [subject],
+                )?;
+                transaction.execute(
+                    "UPDATE mutation_outbox SET preserve_on_epoch_adopt=1
+                     WHERE profile_id IN (
+                       SELECT profile_id FROM profile_sync_policy
+                       WHERE policy='consented' AND subject=?1
+                     )",
+                    [subject],
+                )?;
+            } else {
+                transaction.execute("UPDATE mutation_outbox SET preserve_on_epoch_adopt=1", [])?;
+                transaction.execute(
+                    "INSERT OR REPLACE INTO profile_sync_policy(profile_id, policy, subject)
+                     SELECT id, 'consented', ?1 FROM profiles",
+                    [subject],
+                )?;
+                transaction.execute(
+                    "INSERT OR REPLACE INTO profile_sync_policy(profile_id, policy, subject)
+                     SELECT profile_id, 'consented', ?1 FROM mutation_outbox
+                     WHERE profile_id<>''",
+                    [subject],
+                )?;
+                transaction.execute(
+                    "INSERT OR REPLACE INTO profile_sync_policy(profile_id, policy, subject)
+                     SELECT profile_id, 'consented', ?1 FROM mutation_quarantine
+                     WHERE profile_id<>''",
+                    [subject],
+                )?;
+                transaction.execute(
+                    "UPDATE profile_sync_policy SET policy='consented', subject=?1
+                     WHERE policy='unclaimed'",
+                    [subject],
+                )?;
+            }
             let profiles_to_upload = {
                 let mut statement = transaction.prepare(
                     "SELECT p.id, p.name, p.source_path, p.target_path, p.exclusions_json,
                             p.created_at, p.updated_at
                      FROM profiles p
                      JOIN profile_sync_policy policy ON policy.profile_id=p.id
-                     WHERE policy.policy='unclaimed'
-                        OR (policy.policy='local-only' AND policy.subject=?1)",
+                     WHERE policy.policy='consented' AND policy.subject=?1",
                 )?;
                 let rows = statement.query_map([subject], |row| {
                     let exclusions: String = row.get(4)?;
@@ -1553,9 +1657,6 @@ impl Database {
                 })?;
                 rows.collect::<Result<Vec<_>, _>>()?
             };
-            if !same_owner {
-                transaction.execute("UPDATE mutation_outbox SET preserve_on_epoch_adopt=1", [])?;
-            }
             for profile in profiles_to_upload {
                 if validate_profile(&profile).is_err() {
                     continue;
@@ -1581,8 +1682,11 @@ impl Database {
                 }
             }
             transaction.execute(
-                "UPDATE profile_sync_policy SET policy='consented', subject=?1
-                 WHERE policy='unclaimed' OR (policy='local-only' AND subject=?1)",
+                "UPDATE mutation_quarantine SET subject=?1
+                 WHERE provenance='pre-login' AND profile_id IN (
+                   SELECT profile_id FROM profile_sync_policy
+                   WHERE policy='consented' AND subject=?1
+                 )",
                 [subject],
             )?;
         }
@@ -1593,6 +1697,9 @@ impl Database {
                    session_generation=session_generation + 1,
                    preserve_outbox_on_epoch_adopt=CASE WHEN EXISTS(
                      SELECT 1 FROM mutation_outbox WHERE preserve_on_epoch_adopt=1
+                     UNION ALL
+                     SELECT 1 FROM profile_sync_policy
+                     WHERE policy='consented' AND subject=?2
                    ) THEN 1 ELSE preserve_outbox_on_epoch_adopt END,
                    lifecycle_generation=?1
                  WHERE singleton=1 AND subject=?2",
@@ -1768,28 +1875,39 @@ impl Database {
         expected_lifecycle_generation: Option<&str>,
     ) -> Result<(serde_json::Value, String), NativeError> {
         let mut connection = self.connection();
-        let claim_required_before_quarantine: i64 = connection.query_row(
+        let unbound_claim_required_before_quarantine: i64 = connection.query_row(
             "SELECT EXISTS(
                SELECT 1 FROM mutation_outbox
                UNION ALL
+               SELECT 1 FROM profiles
+               UNION ALL
                SELECT 1 FROM profile_sync_policy WHERE policy='unclaimed'
                UNION ALL
-               SELECT 1 FROM mutation_quarantine WHERE provenance='pre-login'
+               SELECT 1
+               FROM mutation_quarantine quarantine
+               LEFT JOIN profile_sync_policy policy ON policy.profile_id=quarantine.profile_id
+               WHERE quarantine.provenance='pre-login'
+                 AND (policy.profile_id IS NULL OR policy.policy='unclaimed')
              )",
             [],
             |row| row.get(0),
         )?;
         quarantine_invalid_outbox(&mut connection)?;
-        let account_claim_required = claim_required_before_quarantine == 1
-            || connection.query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM profile_sync_policy WHERE policy='unclaimed'
-                   UNION ALL
-                   SELECT 1 FROM mutation_quarantine WHERE provenance='pre-login'
-                 )",
-                [],
-                |row| row.get::<_, i64>(0),
-            )? == 1;
+        let unresolved_account_claim: i64 = connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM profile_sync_policy WHERE policy='unclaimed'
+               UNION ALL
+               SELECT 1
+               FROM mutation_quarantine quarantine
+               LEFT JOIN profile_sync_policy policy ON policy.profile_id=quarantine.profile_id
+               WHERE quarantine.provenance='pre-login'
+                 AND (policy.profile_id IS NULL OR policy.policy='unclaimed')
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        let unbound_account_claim_required =
+            unbound_claim_required_before_quarantine == 1 || unresolved_account_claim == 1;
         let device_id: String = match connection
             .query_row(
                 "SELECT value FROM settings WHERE key='device_id'",
@@ -1851,10 +1969,16 @@ impl Database {
         } else {
             match current {
                     Some((owner, epoch, cursor, lifecycle_generation)) if owner == subject => {
+                        if unresolved_account_claim == 1 {
+                            return Err(NativeError::new(
+                                NativeErrorCode::SyncAccountClaimRequired,
+                                "Choose whether this account may upload existing local profiles.",
+                            ));
+                        }
                         (epoch, cursor, lifecycle_generation)
                     }
                     Some((owner, _, _, _)) if owner.is_empty() => {
-                        if account_claim_required {
+                        if unbound_account_claim_required {
                             return Err(NativeError::new(
                                 NativeErrorCode::SyncAccountClaimRequired,
                                 "Choose whether this account may upload existing local profiles.",
@@ -1878,7 +2002,7 @@ impl Database {
                         ))
                     }
                     None => {
-                        if account_claim_required {
+                        if unbound_account_claim_required {
                             return Err(NativeError::new(
                                 NativeErrorCode::SyncAccountClaimRequired,
                                 "Choose whether this account may upload existing local profiles.",

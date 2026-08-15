@@ -67,6 +67,64 @@ fn create_v5_database_with_invalid_profile(path: &std::path::Path, profile: &Pro
         .unwrap();
 }
 
+fn create_v6_database(path: &std::path::Path) -> Connection {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(&format!(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (1);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (2);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (3);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (4);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (5);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (6);",
+            include_str!("../migrations/0001_offline_state.sql"),
+            include_str!("../migrations/0002_account_scoped_sync.sql"),
+            include_str!("../migrations/0003_sync_session_generation.sql"),
+            include_str!("../migrations/0004_consented_epoch_adoption.sql"),
+            include_str!("../migrations/0005_sync_lifecycle_generation.sql"),
+            include_str!("../migrations/0006_invalid_outbox_quarantine.sql"),
+        ))
+        .unwrap();
+    connection
+}
+
+fn insert_legacy_profile(connection: &Connection, profile: &Profile) {
+    connection
+        .execute(
+            "INSERT INTO profiles(
+               id, name, source_path, target_path, exclusions_json, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                profile.id,
+                profile.name,
+                profile.source_path,
+                profile.target_path,
+                serde_json::to_string(&profile.exclusions).unwrap(),
+                profile.created_at,
+                profile.updated_at
+            ],
+        )
+        .unwrap();
+}
+
+fn insert_legacy_sync_state(connection: &Connection, subject: &str) {
+    connection
+        .execute(
+            "INSERT INTO sync_state(singleton, epoch, cursor, subject)
+             VALUES (1, '00000000-0000-4000-8000-000000000600', '', ?1)",
+            [subject],
+        )
+        .unwrap();
+}
+
 #[test]
 fn scans_additively_and_revalidates_before_mkdir() {
     let source = tempdir().unwrap();
@@ -562,33 +620,14 @@ fn v5_upgrade_quarantines_invalid_outbox_without_removing_local_profiles_and_rec
 fn v6_upgrade_backfills_existing_prelogin_quarantine_provenance() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("v6-quarantine.sqlite3");
-    let connection = Connection::open(&path).unwrap();
+    let connection = create_v6_database(&path);
     connection
-        .execute_batch(&format!(
-            "PRAGMA foreign_keys = ON;
-             CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-             {}
-             INSERT INTO schema_migrations(version) VALUES (1);
-             {}
-             INSERT INTO schema_migrations(version) VALUES (2);
-             {}
-             INSERT INTO schema_migrations(version) VALUES (3);
-             {}
-             INSERT INTO schema_migrations(version) VALUES (4);
-             {}
-             INSERT INTO schema_migrations(version) VALUES (5);
-             {}
-             INSERT INTO schema_migrations(version) VALUES (6);
-             INSERT INTO mutation_quarantine(mutation_id, kind, profile_id, reason)
+        .execute(
+            "INSERT INTO mutation_quarantine(mutation_id, kind, profile_id, reason)
              VALUES ('00000000-0000-4000-8007-000000000006', 'upsert',
-                     'legacy-prelogin', 'legacy invalid profile');",
-            include_str!("../migrations/0001_offline_state.sql"),
-            include_str!("../migrations/0002_account_scoped_sync.sql"),
-            include_str!("../migrations/0003_sync_session_generation.sql"),
-            include_str!("../migrations/0004_consented_epoch_adoption.sql"),
-            include_str!("../migrations/0005_sync_lifecycle_generation.sql"),
-            include_str!("../migrations/0006_invalid_outbox_quarantine.sql"),
-        ))
+                     'legacy-prelogin', 'legacy invalid profile')",
+            [],
+        )
         .unwrap();
     drop(connection);
 
@@ -600,6 +639,258 @@ fn v6_upgrade_backfills_existing_prelogin_quarantine_provenance() {
     assert_eq!(
         database.hosted_sync_request("alice").unwrap_err().code,
         NativeErrorCode::SyncAccountClaimRequired,
+    );
+}
+
+#[test]
+fn v6_unbound_valid_outbox_keep_local_never_leaks_after_edit_delete_epoch_or_switch() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("v6-valid-outbox-keep.sqlite3");
+    let profile = Profile {
+        id: "v6-private-profile".into(),
+        name: "Legacy private".into(),
+        source_path: "/Users/alice/private/v6-source".into(),
+        target_path: "/Volumes/alice/private/v6-target".into(),
+        exclusions: vec!["secret-*".into()],
+        created_at: "2026-08-15T00:00:00Z".into(),
+        updated_at: "2026-08-15T00:00:00Z".into(),
+    };
+    let connection = create_v6_database(&path);
+    insert_legacy_sync_state(&connection, "");
+    connection
+        .execute(
+            "INSERT INTO mutation_outbox(mutation_id, kind, payload, occurred_at, profile_id)
+             VALUES (?1, 'upsert', ?2, ?3, ?4)",
+            rusqlite::params![
+                "00000000-0000-4000-8007-000000000061",
+                serde_json::to_string(&profile).unwrap(),
+                profile.updated_at,
+                profile.id
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let database = Database::open(&path).unwrap();
+    let migrated_policy: (String, String) = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT policy, subject FROM profile_sync_policy WHERE profile_id=?1",
+            [&profile.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(migrated_policy, ("unclaimed".into(), String::new()));
+    assert_eq!(
+        database.hosted_sync_request("alice").unwrap_err().code,
+        NativeErrorCode::SyncAccountClaimRequired
+    );
+    database.claim_hosted_account("alice", false).unwrap();
+    let mut edited = profile.clone();
+    edited.name = "Private edit".into();
+    edited.updated_at = "2026-08-15T00:01:00Z".into();
+    database.save_profile(&edited).unwrap();
+    let alice = database.hosted_sync_request("alice").unwrap();
+    assert_eq!(alice["mutations"], serde_json::json!([]));
+    assert!(!alice.to_string().contains("/Users/alice/private"));
+
+    database
+        .accept_account_epoch("alice", "00000000-0000-4000-8000-000000000611", false)
+        .unwrap();
+    assert!(database.pending_outbox().unwrap().is_empty());
+    database.disconnect_hosted_account(false).unwrap();
+    assert_eq!(
+        database.hosted_sync_request("bob").unwrap_err().code,
+        NativeErrorCode::SyncAccountClaimRequired
+    );
+    database.claim_hosted_account("bob", false).unwrap();
+    edited.name = "Private after switch".into();
+    edited.updated_at = "2026-08-15T00:02:00Z".into();
+    database.save_profile(&edited).unwrap();
+    assert_eq!(
+        database.hosted_sync_request("bob").unwrap()["mutations"],
+        serde_json::json!([])
+    );
+    database.delete_profile(&edited.id).unwrap();
+    let after_delete = database.hosted_sync_request("bob").unwrap();
+    assert_eq!(after_delete["mutations"], serde_json::json!([]));
+    assert!(!after_delete.to_string().contains("/Users/alice/private"));
+}
+
+#[test]
+fn v6_unbound_retained_profile_without_outbox_requires_a_fresh_claim() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("v6-retained-no-outbox.sqlite3");
+    let profile = Profile {
+        id: "v6-retained-only".into(),
+        name: "Retained only".into(),
+        source_path: "/Users/legacy/retained".into(),
+        target_path: "/Volumes/legacy/retained".into(),
+        exclusions: vec![],
+        created_at: "2026-08-15T00:00:00Z".into(),
+        updated_at: "2026-08-15T00:00:00Z".into(),
+    };
+    let connection = create_v6_database(&path);
+    insert_legacy_sync_state(&connection, "");
+    insert_legacy_profile(&connection, &profile);
+    drop(connection);
+
+    let database = Database::open(&path).unwrap();
+    let migrated_policy: (String, String) = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT policy, subject FROM profile_sync_policy WHERE profile_id=?1",
+            [&profile.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(migrated_policy, ("unclaimed".into(), String::new()));
+    assert_eq!(
+        database.hosted_sync_request("alice").unwrap_err().code,
+        NativeErrorCode::SyncAccountClaimRequired
+    );
+    database.claim_hosted_account("alice", false).unwrap();
+    assert_eq!(
+        database.hosted_sync_request("alice").unwrap()["mutations"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn v6_bound_cloud_state_does_not_prompt_without_ambiguous_quarantine() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("v6-bound-clean.sqlite3");
+    let profile = Profile {
+        id: "v6-bound-clean".into(),
+        name: "Already synced".into(),
+        source_path: "/cloud/source".into(),
+        target_path: "/cloud/target".into(),
+        exclusions: vec![],
+        created_at: "2026-08-15T00:00:00Z".into(),
+        updated_at: "2026-08-15T00:00:00Z".into(),
+    };
+    let connection = create_v6_database(&path);
+    insert_legacy_sync_state(&connection, "alice");
+    insert_legacy_profile(&connection, &profile);
+    drop(connection);
+
+    let database = Database::open(&path).unwrap();
+    let policy_count: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM profile_sync_policy WHERE profile_id=?1",
+            [&profile.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(policy_count, 0);
+    assert_eq!(
+        database.hosted_sync_request("alice").unwrap()["mutations"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn v6_quarantine_is_ambiguous_even_with_a_populated_subject_and_keep_resolves_it() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("v6-bound-quarantine-keep.sqlite3");
+    let profile = Profile {
+        id: "v6-bound-ambiguous".into(),
+        name: "Ambiguous local".into(),
+        source_path: "/Users/alice/ambiguous".into(),
+        target_path: "/Volumes/alice/ambiguous".into(),
+        exclusions: vec![],
+        created_at: "2026-08-15T00:00:00Z".into(),
+        updated_at: "2026-08-15T00:00:00Z".into(),
+    };
+    let connection = create_v6_database(&path);
+    insert_legacy_sync_state(&connection, "alice");
+    insert_legacy_profile(&connection, &profile);
+    connection
+        .execute(
+            "INSERT INTO mutation_quarantine(mutation_id, kind, profile_id, reason)
+             VALUES ('00000000-0000-4000-8007-000000000062', 'upsert', ?1, 'legacy')",
+            [&profile.id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let database = Database::open(&path).unwrap();
+    let migrated_policy: (String, String) = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT policy, subject FROM profile_sync_policy WHERE profile_id=?1",
+            [&profile.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(migrated_policy, ("unclaimed".into(), String::new()));
+    assert_eq!(
+        database.quarantined_mutations().unwrap()[0].provenance,
+        "pre-login"
+    );
+    assert_eq!(
+        database.hosted_sync_request("alice").unwrap_err().code,
+        NativeErrorCode::SyncAccountClaimRequired
+    );
+    database.claim_hosted_account("alice", false).unwrap();
+    assert_eq!(
+        database.hosted_sync_request("alice").unwrap()["mutations"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn v6_bound_quarantine_upload_consent_survives_epoch_until_correction() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("v6-bound-quarantine-upload.sqlite3");
+    let invalid = Profile {
+        id: "v6-bound-upload".into(),
+        name: "n".repeat(81),
+        source_path: "/Users/alice/upload-consented".into(),
+        target_path: "/Volumes/alice/upload-consented".into(),
+        exclusions: vec![],
+        created_at: "2026-08-15T00:00:00Z".into(),
+        updated_at: "2026-08-15T00:00:00Z".into(),
+    };
+    let connection = create_v6_database(&path);
+    insert_legacy_sync_state(&connection, "alice");
+    insert_legacy_profile(&connection, &invalid);
+    connection
+        .execute(
+            "INSERT INTO mutation_quarantine(mutation_id, kind, profile_id, reason)
+             VALUES ('00000000-0000-4000-8007-000000000063', 'upsert', ?1, 'legacy')",
+            [&invalid.id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let database = Database::open(&path).unwrap();
+    assert_eq!(
+        database.hosted_sync_request("alice").unwrap_err().code,
+        NativeErrorCode::SyncAccountClaimRequired
+    );
+    database.claim_hosted_account("alice", true).unwrap();
+    assert_eq!(
+        database.hosted_sync_request("alice").unwrap()["mutations"],
+        serde_json::json!([])
+    );
+    assert!(database.preserves_consented_outbox("alice").unwrap());
+    database
+        .accept_account_epoch("alice", "00000000-0000-4000-8000-000000000612", false)
+        .unwrap();
+
+    let corrected = Profile {
+        name: "Corrected after consent".into(),
+        updated_at: "2026-08-15T00:01:00Z".into(),
+        ..invalid
+    };
+    database.save_profile(&corrected).unwrap();
+    let request = database.hosted_sync_request("alice").unwrap();
+    assert_eq!(request["mutations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        request["mutations"][0]["profile"]["sourcePath"],
+        corrected.source_path
     );
 }
 
