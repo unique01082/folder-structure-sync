@@ -698,6 +698,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         4,
         include_str!("../migrations/0004_consented_epoch_adoption.sql"),
     ),
+    (
+        5,
+        include_str!("../migrations/0005_sync_lifecycle_generation.sql"),
+    ),
 ];
 const HOSTED_SYNC_MUTATION_LIMIT: usize = 100;
 const HOSTED_SYNC_BODY_LIMIT: usize = 256 * 1024;
@@ -890,10 +894,13 @@ impl Database {
     }
 
     pub fn set_sync_cursor(&self, epoch: &str, cursor: &str) -> Result<(), NativeError> {
+        let lifecycle_generation = Uuid::new_v4().to_string();
         self.connection().execute(
-            "INSERT INTO sync_state(singleton, epoch, cursor, subject) VALUES (1, ?1, ?2, '')
-             ON CONFLICT(singleton) DO UPDATE SET epoch=excluded.epoch, cursor=excluded.cursor",
-            params![epoch, cursor],
+            "INSERT INTO sync_state(singleton, epoch, cursor, subject, lifecycle_generation)
+             VALUES (1, ?1, ?2, '', ?3)
+             ON CONFLICT(singleton) DO UPDATE SET epoch=excluded.epoch, cursor=excluded.cursor,
+             lifecycle_generation=excluded.lifecycle_generation",
+            params![epoch, cursor, lifecycle_generation],
         )?;
         Ok(())
     }
@@ -920,23 +927,6 @@ impl Database {
             .optional()?)
     }
 
-    fn set_sync_binding(
-        &self,
-        subject: &str,
-        epoch: &str,
-        cursor: &str,
-    ) -> Result<(), NativeError> {
-        self.connection().execute(
-            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation, preserve_outbox_on_epoch_adopt)
-             VALUES (1, ?1, ?2, ?3, 1, 0)
-             ON CONFLICT(singleton) DO UPDATE SET subject=excluded.subject, epoch=excluded.epoch,
-             cursor=excluded.cursor, session_generation=sync_state.session_generation + 1,
-             preserve_outbox_on_epoch_adopt=0",
-            params![subject, epoch, cursor],
-        )?;
-        Ok(())
-    }
-
     pub fn clear_local_synced_data(&self) -> Result<(), NativeError> {
         let mut connection = self.connection();
         let transaction = connection.transaction()?;
@@ -953,13 +943,16 @@ impl Database {
     ) -> Result<(), NativeError> {
         let mut connection = self.connection();
         let transaction = connection.transaction()?;
+        let lifecycle_generation = Uuid::new_v4().to_string();
         transaction.execute("DELETE FROM mutation_outbox", [])?;
         transaction.execute(
-            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation, preserve_outbox_on_epoch_adopt)
-             VALUES (1, '', '', '', 1, 0)
+            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation,
+             preserve_outbox_on_epoch_adopt, lifecycle_generation)
+             VALUES (1, '', '', '', 1, 0, ?1)
              ON CONFLICT(singleton) DO UPDATE SET subject='', epoch='', cursor='',
-             session_generation=sync_state.session_generation + 1, preserve_outbox_on_epoch_adopt=0",
-            [],
+             session_generation=sync_state.session_generation + 1, preserve_outbox_on_epoch_adopt=0,
+             lifecycle_generation=excluded.lifecycle_generation",
+            [lifecycle_generation],
         )?;
         if remove_local_profiles {
             transaction.execute("DELETE FROM profiles", [])?;
@@ -1007,13 +1000,21 @@ impl Database {
             transaction.execute("UPDATE mutation_outbox SET preserve_on_epoch_adopt=1", [])?;
         }
         let epoch = Uuid::new_v4().to_string();
+        let lifecycle_generation = Uuid::new_v4().to_string();
         transaction.execute(
-            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation, preserve_outbox_on_epoch_adopt)
-             VALUES (1, ?1, ?2, '', 1, ?3)
+            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation,
+             preserve_outbox_on_epoch_adopt, lifecycle_generation)
+             VALUES (1, ?1, ?2, '', 1, ?3, ?4)
              ON CONFLICT(singleton) DO UPDATE SET subject=excluded.subject, epoch=excluded.epoch,
              cursor='', session_generation=sync_state.session_generation + 1,
-             preserve_outbox_on_epoch_adopt=excluded.preserve_outbox_on_epoch_adopt",
-            params![subject, epoch, i64::from(upload_existing)],
+             preserve_outbox_on_epoch_adopt=excluded.preserve_outbox_on_epoch_adopt,
+             lifecycle_generation=excluded.lifecycle_generation",
+            params![
+                subject,
+                epoch,
+                i64::from(upload_existing),
+                lifecycle_generation
+            ],
         )?;
         transaction.commit()?;
         Ok(())
@@ -1050,13 +1051,21 @@ impl Database {
         if remove_local_profiles {
             transaction.execute("DELETE FROM profiles", [])?;
         }
+        let lifecycle_generation = Uuid::new_v4().to_string();
         transaction.execute(
-            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation, preserve_outbox_on_epoch_adopt)
-             VALUES (1, ?1, ?2, '', 1, 0)
+            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation,
+             preserve_outbox_on_epoch_adopt, lifecycle_generation)
+             VALUES (1, ?1, ?2, '', 1, 0, ?4)
              ON CONFLICT(singleton) DO UPDATE SET subject=excluded.subject, epoch=excluded.epoch,
              cursor='', session_generation=sync_state.session_generation + 1,
-             preserve_outbox_on_epoch_adopt=CASE WHEN ?3 THEN 1 ELSE 0 END",
-            params![subject, epoch, preserve_consented_outbox],
+             preserve_outbox_on_epoch_adopt=CASE WHEN ?3 THEN 1 ELSE 0 END,
+             lifecycle_generation=excluded.lifecycle_generation",
+            params![
+                subject,
+                epoch,
+                preserve_consented_outbox,
+                lifecycle_generation
+            ],
         )?;
         transaction.commit()?;
         Ok(())
@@ -1112,62 +1121,139 @@ impl Database {
         if remove_local_profiles {
             transaction.execute("DELETE FROM profiles", [])?;
         }
+        let lifecycle_generation = Uuid::new_v4().to_string();
         transaction.execute(
             "UPDATE sync_state SET epoch=?1, cursor='', session_generation=session_generation + 1,
-             preserve_outbox_on_epoch_adopt=0
+             preserve_outbox_on_epoch_adopt=0, lifecycle_generation=?6
              WHERE singleton=1 AND subject=?2 AND epoch=?3 AND cursor=?4 AND session_generation=?5",
             params![
                 next_epoch,
                 expected_subject,
                 expected_epoch,
                 expected_cursor,
-                expected_generation
+                expected_generation,
+                lifecycle_generation
             ],
         )?;
         transaction.commit()?;
         Ok(())
     }
 
-    pub fn hosted_sync_request(&self, subject: &str) -> Result<serde_json::Value, NativeError> {
-        let device_id = self.device_id()?;
-        let has_unclaimed_mutations = !self.pending_outbox()?.is_empty();
-        let (epoch, cursor) = match self.sync_binding()? {
-            Some((owner, epoch, cursor, _)) if owner == subject => (epoch, cursor),
-            Some((owner, _, _, _)) if owner.is_empty() => {
-                if has_unclaimed_mutations {
-                    return Err(NativeError::new(
-                        NativeErrorCode::SyncAccountClaimRequired,
-                        "Choose whether this account may upload existing local profiles.",
-                    ));
-                }
-                let epoch = Uuid::new_v4().to_string();
-                self.set_sync_binding(subject, &epoch, "")?;
-                (epoch, String::new())
-            }
-            Some(_) => {
-                return Err(NativeError::new(
-                    NativeErrorCode::AuthRequired,
-                    "Local hosted-sync state belongs to another account. Sign out before switching accounts.",
-                ))
-            }
+    fn build_hosted_sync_request(
+        &self,
+        subject: &str,
+        expected_lifecycle_generation: Option<&str>,
+    ) -> Result<(serde_json::Value, String), NativeError> {
+        let connection = self.connection();
+        let device_id: String = match connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='device_id'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+        {
+            Some(device_id) => device_id,
             None => {
-                if has_unclaimed_mutations {
-                    return Err(NativeError::new(
-                        NativeErrorCode::SyncAccountClaimRequired,
-                        "Choose whether this account may upload existing local profiles.",
-                    ));
-                }
-                let epoch = Uuid::new_v4().to_string();
-                self.set_sync_binding(subject, &epoch, "")?;
-                (epoch, String::new())
+                let device_id = Uuid::new_v4().to_string();
+                connection.execute(
+                    "INSERT INTO settings(key, value) VALUES ('device_id', ?1)",
+                    [&device_id],
+                )?;
+                device_id
             }
         };
-        let mut mutations = Vec::new();
-        for mutation in self
-            .pending_outbox()?
-            .into_iter()
-            .take(HOSTED_SYNC_MUTATION_LIMIT)
+        let pending = {
+            let mut statement = connection.prepare(
+                "SELECT mutation_id, kind, payload, occurred_at
+                 FROM mutation_outbox ORDER BY sequence ASC",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(OutboxMutation {
+                    mutation_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    payload: row.get(2)?,
+                    occurred_at: row.get(3)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let current: Option<(String, String, String, String)> = connection
+            .query_row(
+                "SELECT subject, epoch, cursor, lifecycle_generation
+                 FROM sync_state WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let (epoch, cursor, lifecycle_generation) = if let Some(expected_lifecycle_generation) =
+            expected_lifecycle_generation
         {
+            match current {
+                Some((owner, epoch, cursor, lifecycle_generation))
+                    if owner == subject
+                        && lifecycle_generation == expected_lifecycle_generation =>
+                {
+                    (epoch, cursor, lifecycle_generation)
+                }
+                _ => {
+                    return Err(NativeError::new(
+                        NativeErrorCode::SyncStateChanged,
+                        "Hosted sync lifecycle changed; the stale request was stopped.",
+                    ))
+                }
+            }
+        } else {
+            match current {
+                    Some((owner, epoch, cursor, lifecycle_generation)) if owner == subject => {
+                        (epoch, cursor, lifecycle_generation)
+                    }
+                    Some((owner, _, _, _)) if owner.is_empty() => {
+                        if !pending.is_empty() {
+                            return Err(NativeError::new(
+                                NativeErrorCode::SyncAccountClaimRequired,
+                                "Choose whether this account may upload existing local profiles.",
+                            ));
+                        }
+                        let epoch = Uuid::new_v4().to_string();
+                        let lifecycle_generation = Uuid::new_v4().to_string();
+                        connection.execute(
+                            "UPDATE sync_state SET subject=?1, epoch=?2, cursor='',
+                             session_generation=session_generation + 1,
+                             preserve_outbox_on_epoch_adopt=0, lifecycle_generation=?3
+                             WHERE singleton=1",
+                            params![subject, epoch, lifecycle_generation],
+                        )?;
+                        (epoch, String::new(), lifecycle_generation)
+                    }
+                    Some(_) => {
+                        return Err(NativeError::new(
+                            NativeErrorCode::AuthRequired,
+                            "Local hosted-sync state belongs to another account. Sign out before switching accounts.",
+                        ))
+                    }
+                    None => {
+                        if !pending.is_empty() {
+                            return Err(NativeError::new(
+                                NativeErrorCode::SyncAccountClaimRequired,
+                                "Choose whether this account may upload existing local profiles.",
+                            ));
+                        }
+                        let epoch = Uuid::new_v4().to_string();
+                        let lifecycle_generation = Uuid::new_v4().to_string();
+                        connection.execute(
+                            "INSERT INTO sync_state(
+                               singleton, subject, epoch, cursor, session_generation,
+                               preserve_outbox_on_epoch_adopt, lifecycle_generation
+                             ) VALUES (1, ?1, ?2, '', 1, 0, ?3)",
+                            params![subject, epoch, lifecycle_generation],
+                        )?;
+                        (epoch, String::new(), lifecycle_generation)
+                    }
+                }
+        };
+        let mut mutations = Vec::new();
+        for mutation in pending.into_iter().take(HOSTED_SYNC_MUTATION_LIMIT) {
             let payload: serde_json::Value =
                 serde_json::from_str(&mutation.payload).map_err(internal_error)?;
             let value = if mutation.kind == "upsert" {
@@ -1212,7 +1298,27 @@ impl Database {
         if !cursor.is_empty() {
             request["cursor"] = serde_json::Value::String(cursor);
         }
-        Ok(request)
+        Ok((request, lifecycle_generation))
+    }
+
+    fn initial_hosted_sync_request(
+        &self,
+        subject: &str,
+    ) -> Result<(serde_json::Value, String), NativeError> {
+        self.build_hosted_sync_request(subject, None)
+    }
+
+    fn hosted_sync_request_for_lifecycle(
+        &self,
+        subject: &str,
+        lifecycle_generation: &str,
+    ) -> Result<(serde_json::Value, String), NativeError> {
+        self.build_hosted_sync_request(subject, Some(lifecycle_generation))
+    }
+
+    pub fn hosted_sync_request(&self, subject: &str) -> Result<serde_json::Value, NativeError> {
+        self.initial_hosted_sync_request(subject)
+            .map(|(request, _)| request)
     }
 
     pub fn hosted_sync_generation(
@@ -1232,6 +1338,26 @@ impl Database {
                     "Hosted sync state changed; retry with the current account session.",
                 )
             })
+    }
+
+    fn is_hosted_sync_lifecycle_current(
+        &self,
+        subject: &str,
+        epoch: &str,
+        cursor: &str,
+        lifecycle_generation: &str,
+    ) -> Result<bool, NativeError> {
+        Ok(self
+            .connection()
+            .query_row(
+                "SELECT 1 FROM sync_state
+                 WHERE singleton=1 AND subject=?1 AND epoch=?2 AND cursor=?3
+                 AND lifecycle_generation=?4",
+                params![subject, epoch, cursor, lifecycle_generation],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     pub fn apply_hosted_sync_response(
@@ -1548,104 +1674,55 @@ struct HostedSyncOutcome {
 #[derive(Default)]
 struct HostedSyncLock(tokio::sync::Mutex<()>);
 
-#[tauri::command]
-async fn sync_hosted_profiles(
-    api_url: String,
-    access_token: String,
-    subject: String,
-    database: State<'_, Database>,
-    sync_lock: State<'_, HostedSyncLock>,
-) -> Result<HostedSyncOutcome, NativeError> {
-    let _sync_guard = sync_lock.0.lock().await;
-    let base = url::Url::parse(&api_url).map_err(|_| {
-        NativeError::new(
-            NativeErrorCode::Internal,
-            "Hosted sync configuration is invalid.",
-        )
-    })?;
-    if base.scheme() != "https" || base.host_str().is_none() {
-        return Err(NativeError::new(
-            NativeErrorCode::Internal,
-            "Hosted sync requires an HTTPS endpoint.",
-        ));
-    }
-    let endpoint = base.join("/v1/sync").map_err(|_| {
-        NativeError::new(
-            NativeErrorCode::Internal,
-            "Hosted sync configuration is invalid.",
-        )
-    })?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|_| {
-            NativeError::new(
-                NativeErrorCode::Internal,
-                "Hosted sync is unavailable; local data remains safe.",
-            )
-        })?;
+async fn run_hosted_sync_loop<Send, Response>(
+    database: &Database,
+    subject: &str,
+    mut send: Send,
+) -> Result<HostedSyncOutcome, NativeError>
+where
+    Send: FnMut(serde_json::Value) -> Response,
+    Response:
+        std::future::Future<Output = Result<(reqwest::StatusCode, serde_json::Value), NativeError>>,
+{
     let mut acknowledged = 0;
     let mut records_applied = 0;
+    let mut lifecycle_generation: Option<String> = None;
     let cursor = loop {
-        let payload = database.hosted_sync_request(&subject)?;
+        let (payload, request_lifecycle_generation) = if let Some(expected_lifecycle_generation) =
+            lifecycle_generation.as_deref()
+        {
+            database.hosted_sync_request_for_lifecycle(subject, expected_lifecycle_generation)?
+        } else {
+            database.initial_hosted_sync_request(subject)?
+        };
         let expected_epoch = payload["epoch"].as_str().unwrap_or_default().to_owned();
         let expected_cursor = payload["cursor"].as_str().unwrap_or_default().to_owned();
+        lifecycle_generation = Some(request_lifecycle_generation.clone());
         let expected_generation =
-            database.hosted_sync_generation(&subject, &expected_epoch, &expected_cursor)?;
+            database.hosted_sync_generation(subject, &expected_epoch, &expected_cursor)?;
         let sent_ids: HashSet<String> = payload["mutations"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|mutation| mutation["mutationId"].as_str().map(ToOwned::to_owned))
             .collect();
-        let mut response = client
-            .post(endpoint.clone())
-            .bearer_auth(&access_token)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::Internal,
-                    "Hosted sync is unavailable; local data remains safe.",
-                )
-            })?;
-        let status = response.status();
-        if response
-            .content_length()
-            .is_some_and(|length| length > 2 * 1024 * 1024)
-        {
+        let (status, body) = send(payload).await?;
+        if !database.is_hosted_sync_lifecycle_current(
+            subject,
+            &expected_epoch,
+            &expected_cursor,
+            &request_lifecycle_generation,
+        )? {
             return Err(NativeError::new(
-                NativeErrorCode::Internal,
-                "Hosted sync returned an oversized response.",
+                NativeErrorCode::SyncStateChanged,
+                "Hosted sync lifecycle changed; the stale response was stopped.",
             ));
         }
-        let mut response_bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| {
-            NativeError::new(
-                NativeErrorCode::Internal,
-                "Hosted sync returned an invalid response.",
-            )
-        })? {
-            if response_bytes.len() + chunk.len() > 2 * 1024 * 1024 {
-                return Err(NativeError::new(
-                    NativeErrorCode::Internal,
-                    "Hosted sync returned an oversized response.",
-                ));
-            }
-            response_bytes.extend_from_slice(&chunk);
-        }
-        let body: serde_json::Value = serde_json::from_slice(&response_bytes).map_err(|_| {
-            NativeError::new(
-                NativeErrorCode::Internal,
-                "Hosted sync returned an invalid response.",
-            )
-        })?;
         if status == reqwest::StatusCode::CONFLICT
             && body.get("code").and_then(serde_json::Value::as_str)
                 == Some("SYNC_EPOCH_RESET_REQUIRED")
         {
-            let preserves_consented_outbox = database.preserves_consented_outbox(&subject)?;
+            let preserves_consented_outbox = database.preserves_consented_outbox(subject)?;
             return Err(NativeError {
                 code: NativeErrorCode::SyncEpochResetRequired,
                 message: if preserves_consented_outbox {
@@ -1654,15 +1731,12 @@ async fn sync_hosted_profiles(
                     "Hosted profile data was reset. Review this device before uploading again."
                 }
                 .into(),
-                details: body
-                    .get("epoch")
-                    .cloned()
-                    .map(|epoch| {
-                        json!({
-                            "epoch": epoch,
-                            "preservesConsentedOutbox": preserves_consented_outbox
-                        })
-                    }),
+                details: body.get("epoch").cloned().map(|epoch| {
+                    json!({
+                        "epoch": epoch,
+                        "preservesConsentedOutbox": preserves_consented_outbox
+                    })
+                }),
             });
         }
         if !status.is_success() {
@@ -1681,14 +1755,24 @@ async fn sync_hosted_profiles(
             .unwrap_or_default()
             .to_owned();
         match database.apply_hosted_sync_response(
-            &subject,
+            subject,
             &expected_epoch,
             &expected_cursor,
             expected_generation,
             &body,
         ) {
             Ok(()) => {}
-            Err(error) if error.code == NativeErrorCode::SyncStateChanged => continue,
+            Err(error) if error.code == NativeErrorCode::SyncStateChanged => {
+                if database.is_hosted_sync_lifecycle_current(
+                    subject,
+                    &expected_epoch,
+                    &expected_cursor,
+                    &request_lifecycle_generation,
+                )? {
+                    continue;
+                }
+                return Err(error);
+            }
             Err(error) => return Err(error),
         }
         acknowledged += body
@@ -1730,6 +1814,96 @@ async fn sync_hosted_profiles(
         records_applied,
         cursor,
     })
+}
+
+#[tauri::command]
+async fn sync_hosted_profiles(
+    api_url: String,
+    access_token: String,
+    subject: String,
+    database: State<'_, Database>,
+    sync_lock: State<'_, HostedSyncLock>,
+) -> Result<HostedSyncOutcome, NativeError> {
+    let _sync_guard = sync_lock.0.lock().await;
+    let base = url::Url::parse(&api_url).map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::Internal,
+            "Hosted sync configuration is invalid.",
+        )
+    })?;
+    if base.scheme() != "https" || base.host_str().is_none() {
+        return Err(NativeError::new(
+            NativeErrorCode::Internal,
+            "Hosted sync requires an HTTPS endpoint.",
+        ));
+    }
+    let endpoint = base.join("/v1/sync").map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::Internal,
+            "Hosted sync configuration is invalid.",
+        )
+    })?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "Hosted sync is unavailable; local data remains safe.",
+            )
+        })?;
+    run_hosted_sync_loop(&database, &subject, move |payload| {
+        let client = client.clone();
+        let endpoint = endpoint.clone();
+        let access_token = access_token.clone();
+        async move {
+            let mut response = client
+                .post(endpoint)
+                .bearer_auth(access_token)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|_| {
+                    NativeError::new(
+                        NativeErrorCode::Internal,
+                        "Hosted sync is unavailable; local data remains safe.",
+                    )
+                })?;
+            let status = response.status();
+            if response
+                .content_length()
+                .is_some_and(|length| length > 2 * 1024 * 1024)
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::Internal,
+                    "Hosted sync returned an oversized response.",
+                ));
+            }
+            let mut response_bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "Hosted sync returned an invalid response.",
+                )
+            })? {
+                if response_bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+                    return Err(NativeError::new(
+                        NativeErrorCode::Internal,
+                        "Hosted sync returned an oversized response.",
+                    ));
+                }
+                response_bytes.extend_from_slice(&chunk);
+            }
+            let body = serde_json::from_slice(&response_bytes).map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "Hosted sync returned an invalid response.",
+                )
+            })?;
+            Ok((status, body))
+        }
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1909,7 +2083,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
+    use tokio::sync::oneshot;
 
     #[test]
     fn mkdir_reports_already_existing_directories() {
@@ -1968,5 +2144,314 @@ mod tests {
         assert_eq!(result.directories[0].status, DirectoryStatus::Created);
         assert!(target.path().join("first").is_dir());
         assert!(!target.path().join("second").exists());
+    }
+
+    #[test]
+    fn command_loop_stops_after_disconnect_and_allows_bob_without_rebinding_alice() {
+        for stale_status in [reqwest::StatusCode::OK, reqwest::StatusCode::CONFLICT] {
+            for remove_local_profiles in [false, true] {
+                tauri::async_runtime::block_on(async {
+                    let directory = tempdir().unwrap();
+                    let database = Arc::new(
+                        Database::open(directory.path().join(format!(
+                            "disconnect-command-loop-{remove_local_profiles}-{}.sqlite3",
+                            stale_status.as_u16()
+                        )))
+                        .unwrap(),
+                    );
+                    let profile = Profile {
+                        id: "alice-local".into(),
+                        name: "Alice local".into(),
+                        source_path: "/alice/private".into(),
+                        target_path: "/alice/target".into(),
+                        exclusions: vec![],
+                        created_at: "2026-08-15T00:00:00Z".into(),
+                        updated_at: "2026-08-15T00:00:00Z".into(),
+                    };
+                    database.save_profile(&profile).unwrap();
+                    database.claim_hosted_account("alice", true).unwrap();
+
+                    let alice_sends = Arc::new(AtomicUsize::new(0));
+                    let (request_started_tx, request_started_rx) = oneshot::channel();
+                    let (response_tx, response_rx) = oneshot::channel();
+                    let task_database = Arc::clone(&database);
+                    let task_sends = Arc::clone(&alice_sends);
+                    let sync = tauri::async_runtime::spawn(async move {
+                        let mut request_started_tx = Some(request_started_tx);
+                        let mut response_rx = Some(response_rx);
+                        run_hosted_sync_loop(&task_database, "alice", move |payload| {
+                            task_sends.fetch_add(1, Ordering::SeqCst);
+                            let started = request_started_tx.take();
+                            let response = response_rx.take();
+                            async move {
+                                if let Some(started) = started {
+                                    let _ = started.send(payload);
+                                }
+                                match response {
+                                    Some(response) => response.await.unwrap(),
+                                    None => Err(NativeError::new(
+                                        NativeErrorCode::Internal,
+                                        "Alice transport was reused after disconnect.",
+                                    )),
+                                }
+                            }
+                        })
+                        .await
+                    });
+
+                    let alice_request = request_started_rx.await.unwrap();
+                    database
+                        .disconnect_hosted_account(remove_local_profiles)
+                        .unwrap();
+                    response_tx
+                    .send(Ok((
+                        stale_status,
+                        if stale_status == reqwest::StatusCode::CONFLICT {
+                            json!({
+                                "code": "SYNC_EPOCH_RESET_REQUIRED",
+                                "epoch": alice_request["epoch"]
+                            })
+                        } else {
+                            json!({
+                                "epoch": alice_request["epoch"],
+                                "cursor": "alice-stale",
+                                "hasMore": false,
+                                "records": [],
+                                "receipts": alice_request["mutations"].as_array().unwrap().iter().enumerate().map(|(index, mutation)| {
+                                    json!({ "mutationId": mutation["mutationId"], "revision": index + 1 })
+                                }).collect::<Vec<_>>()
+                            })
+                        },
+                    )))
+                    .unwrap();
+                    let error = sync.await.unwrap().unwrap_err();
+                    assert_eq!(error.code, NativeErrorCode::SyncStateChanged);
+                    assert_eq!(alice_sends.load(Ordering::SeqCst), 1);
+
+                    database.claim_hosted_account("bob", false).unwrap();
+                    let bob_sends = Arc::new(AtomicUsize::new(0));
+                    let counted_bob_sends = Arc::clone(&bob_sends);
+                    run_hosted_sync_loop(&database, "bob", move |payload| {
+                        counted_bob_sends.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            Ok((
+                                reqwest::StatusCode::OK,
+                                json!({
+                                    "epoch": payload["epoch"],
+                                    "cursor": "bob-current",
+                                    "hasMore": false,
+                                    "records": [],
+                                    "receipts": []
+                                }),
+                            ))
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(bob_sends.load(Ordering::SeqCst), 1);
+                    assert_eq!(database.sync_cursor().unwrap().unwrap().1, "bob-current");
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn strict_followup_request_cannot_rebind_after_preflight_disconnect_interleaving() {
+        let directory = tempdir().unwrap();
+        let database =
+            Database::open(directory.path().join("strict-followup-request.sqlite3")).unwrap();
+        database.claim_hosted_account("alice", false).unwrap();
+        let (_, lifecycle_generation) = database.initial_hosted_sync_request("alice").unwrap();
+
+        database.disconnect_hosted_account(false).unwrap();
+        let error = database
+            .hosted_sync_request_for_lifecycle("alice", &lifecycle_generation)
+            .unwrap_err();
+        assert_eq!(error.code, NativeErrorCode::SyncStateChanged);
+        assert!(database.hosted_sync_request("bob").is_ok());
+    }
+
+    #[test]
+    fn command_loop_preflights_lifecycle_before_building_a_followup_page() {
+        tauri::async_runtime::block_on(async {
+            let directory = tempdir().unwrap();
+            let database =
+                Database::open(directory.path().join("post-success-race.sqlite3")).unwrap();
+            database.claim_hosted_account("alice", false).unwrap();
+            database
+                .connection()
+                .execute_batch(
+                    "CREATE TRIGGER disconnect_after_page_one
+                     AFTER UPDATE OF cursor ON sync_state
+                     WHEN NEW.cursor='page-one'
+                     BEGIN
+                       DELETE FROM mutation_outbox;
+                       UPDATE sync_state SET subject='', epoch='', cursor='',
+                         session_generation=session_generation + 1,
+                         lifecycle_generation=lower(hex(randomblob(16)))
+                       WHERE singleton=1;
+                     END;",
+                )
+                .unwrap();
+            let sends = Arc::new(AtomicUsize::new(0));
+            let counted_sends = Arc::clone(&sends);
+            let error = run_hosted_sync_loop(&database, "alice", move |payload| {
+                let attempt = counted_sends.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt > 0 {
+                        return Err(NativeError::new(
+                            NativeErrorCode::Internal,
+                            "Alice follow-up transport ran after lifecycle invalidation.",
+                        ));
+                    }
+                    Ok((
+                        reqwest::StatusCode::OK,
+                        json!({
+                            "epoch": payload["epoch"],
+                            "cursor": "page-one",
+                            "hasMore": true,
+                            "records": [],
+                            "receipts": []
+                        }),
+                    ))
+                }
+            })
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.code, NativeErrorCode::SyncStateChanged);
+            assert_eq!(sends.load(Ordering::SeqCst), 1);
+            assert!(database.hosted_sync_request("bob").is_ok());
+        });
+    }
+
+    #[test]
+    fn command_loop_rejects_same_account_aba_after_disconnect_and_rebind() {
+        tauri::async_runtime::block_on(async {
+            let directory = tempdir().unwrap();
+            let database = Arc::new(
+                Database::open(directory.path().join("same-account-aba.sqlite3")).unwrap(),
+            );
+            database.claim_hosted_account("alice", false).unwrap();
+            let sends = Arc::new(AtomicUsize::new(0));
+            let (request_started_tx, request_started_rx) = oneshot::channel();
+            let (response_tx, response_rx) = oneshot::channel();
+            let task_database = Arc::clone(&database);
+            let task_sends = Arc::clone(&sends);
+            let sync = tauri::async_runtime::spawn(async move {
+                let mut request_started_tx = Some(request_started_tx);
+                let mut response_rx = Some(response_rx);
+                run_hosted_sync_loop(&task_database, "alice", move |payload| {
+                    task_sends.fetch_add(1, Ordering::SeqCst);
+                    let started = request_started_tx.take();
+                    let response = response_rx.take();
+                    async move {
+                        if let Some(started) = started {
+                            let _ = started.send(payload);
+                        }
+                        match response {
+                            Some(response) => response.await.unwrap(),
+                            None => Err(NativeError::new(
+                                NativeErrorCode::Internal,
+                                "Old Alice transport was reused after account ABA.",
+                            )),
+                        }
+                    }
+                })
+                .await
+            });
+
+            let request = request_started_rx.await.unwrap();
+            let old_epoch = request["epoch"].as_str().unwrap();
+            database.disconnect_hosted_account(false).unwrap();
+            database.claim_hosted_account("alice", false).unwrap();
+            database
+                .accept_account_epoch("alice", old_epoch, false)
+                .unwrap();
+            response_tx
+                .send(Ok((
+                    reqwest::StatusCode::OK,
+                    json!({
+                        "epoch": old_epoch,
+                        "cursor": "stale-aba",
+                        "hasMore": false,
+                        "records": [],
+                        "receipts": []
+                    }),
+                )))
+                .unwrap();
+
+            let error = sync.await.unwrap().unwrap_err();
+            assert_eq!(error.code, NativeErrorCode::SyncStateChanged);
+            assert_eq!(sends.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn command_loop_retries_a_same_subject_edit_generation() {
+        tauri::async_runtime::block_on(async {
+            let directory = tempdir().unwrap();
+            let database = Arc::new(
+                Database::open(directory.path().join("edit-command-loop.sqlite3")).unwrap(),
+            );
+            let profile = Profile {
+                id: "alice-edit".into(),
+                name: "Before request".into(),
+                source_path: "/alice/source".into(),
+                target_path: "/alice/target".into(),
+                exclusions: vec![],
+                created_at: "2026-08-15T00:00:00Z".into(),
+                updated_at: "2026-08-15T00:00:00Z".into(),
+            };
+            database.save_profile(&profile).unwrap();
+            database.claim_hosted_account("alice", true).unwrap();
+            let sends = Arc::new(AtomicUsize::new(0));
+            let transport_database = Arc::clone(&database);
+            let counted_sends = Arc::clone(&sends);
+            let edited_profile = Profile {
+                name: "Edited during request".into(),
+                updated_at: "2026-08-15T00:01:00Z".into(),
+                ..profile
+            };
+
+            run_hosted_sync_loop(&database, "alice", move |payload| {
+                let attempt = counted_sends.fetch_add(1, Ordering::SeqCst);
+                let transport_database = Arc::clone(&transport_database);
+                let edited_profile = edited_profile.clone();
+                async move {
+                    if attempt == 0 {
+                        transport_database.save_profile(&edited_profile).unwrap();
+                    }
+                    let receipts = payload["mutations"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .enumerate()
+                        .map(|(index, mutation)| {
+                            json!({ "mutationId": mutation["mutationId"], "revision": index + 1 })
+                        })
+                        .collect::<Vec<_>>();
+                    Ok((
+                        reqwest::StatusCode::OK,
+                        json!({
+                            "epoch": payload["epoch"],
+                            "cursor": format!("edit-attempt-{attempt}"),
+                            "hasMore": false,
+                            "records": [],
+                            "receipts": receipts
+                        }),
+                    ))
+                }
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(sends.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                database.list_profiles().unwrap()[0].name,
+                "Edited during request"
+            );
+            assert!(database.pending_outbox().unwrap().is_empty());
+        });
     }
 }
