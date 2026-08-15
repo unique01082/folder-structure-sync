@@ -1,4 +1,47 @@
 /** The only synchronization direction supported by Rootline v1. */
+import profileLimits from "./profile-limits.json" with { type: "json" };
+
+export const PROFILE_LIMITS = profileLimits;
+
+export interface ProfileValidationIssue {
+  field: string;
+  min?: number;
+  max: number;
+}
+
+function characterLength(value: string): number {
+  return [...value].length;
+}
+
+/** Runtime validation shared by profile editors and transport boundaries. */
+export function validateSyncProfile(
+  profile: Pick<SyncProfile, "name" | "sourcePath" | "targetPath" | "exclusions">,
+): ProfileValidationIssue[] {
+  const issues: ProfileValidationIssue[] = [];
+  const lengths = [
+    ["name", profile.name, PROFILE_LIMITS.name],
+    ["sourcePath", profile.sourcePath, PROFILE_LIMITS.path],
+    ["targetPath", profile.targetPath, PROFILE_LIMITS.path],
+  ] as const;
+  for (const [field, value, limits] of lengths) {
+    const length = characterLength(value);
+    if (length < limits.min || length > limits.max) {
+      issues.push({ field, min: limits.min, max: limits.max });
+    }
+  }
+  if (profile.exclusions.length > PROFILE_LIMITS.exclusions.max) {
+    issues.push({ field: "exclusions", max: PROFILE_LIMITS.exclusions.max });
+  }
+  profile.exclusions.forEach((pattern, index) => {
+    const length = characterLength(pattern);
+    const limits = PROFILE_LIMITS.exclusions.pattern;
+    if (length < limits.min || length > limits.max) {
+      issues.push({ field: `exclusions[${index}]`, min: limits.min, max: limits.max });
+    }
+  });
+  return issues;
+}
+
 export const SYNC_MODES = ["additive"] as const;
 
 export type SyncMode = (typeof SYNC_MODES)[number];

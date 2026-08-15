@@ -24,7 +24,7 @@ Configuration resolution is deliberately narrow: an explicit `--config` path win
 
 ## Desktop profiles
 
-A saved profile contains a display name, absolute source and target paths, exclusions, timestamps, and additive sync mode. It is local by default. Changing a folder outside Rootline may require re-binding the profile before a new scan. The desktop always supports offline profiles and run history without authentication.
+A saved profile contains a display name, absolute source and target paths, exclusions, timestamps, and additive sync mode. Names contain 1–80 characters, each path 1–4096 characters, and the exclusion list at most 100 patterns of 1–256 characters. It is local by default. Changing a folder outside Rootline may require re-binding the profile before a new scan. The desktop always supports offline profiles and run history without authentication. Removing a local profile does not remove its run history.
 
 ## Optional hosted sync build variables
 

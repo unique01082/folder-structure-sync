@@ -20,6 +20,7 @@ export async function createTestApplication(overrides: Partial<RootlineApiConfig
     server: app.getHttpServer() as Server,
     async resetDatabase() {
       await prisma.mutationReceipt.deleteMany();
+      await prisma.mutationDedup.deleteMany();
       await prisma.syncChange.deleteMany();
       await prisma.profileRecord.deleteMany();
       await prisma.userSyncState.deleteMany();

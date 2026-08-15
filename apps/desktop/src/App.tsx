@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
+import { PROFILE_LIMITS, validateSyncProfile } from "@rootline/contracts";
 
 import { DiffTree } from "./components/DiffTree";
 import { AuthControls } from "./components/AuthControls";
@@ -56,10 +57,16 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
   const [error, setError] = useState<string>();
   const [rebind, setRebind] = useState<RebindRole>(null);
   const [activeOperation, setActiveOperation] = useState<string>();
+  const [deleteCandidate, setDeleteCandidate] = useState<Profile>();
   const headingRef = useRef<HTMLHeadingElement>(null);
   const scanButtonRef = useRef<HTMLButtonElement>(null);
+  const newProfileRef = useRef<HTMLButtonElement>(null);
+  const deleteDialogRef = useRef<HTMLDivElement>(null);
+  const deleteCancelRef = useRef<HTMLButtonElement>(null);
+  const deleteReturnFocusRef = useRef<HTMLElement | null>(null);
   const returnToScanRef = useRef(false);
   const profileNameId = useId();
+  const deleteDialogTitleId = useId();
 
   const reconcileProfiles = (loaded: Profile[]): void => {
     setProfiles(loaded);
@@ -119,6 +126,10 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
   useEffect(() => {
     document.documentElement.lang = locale;
   }, [locale]);
+
+  useEffect(() => {
+    if (deleteCandidate) deleteCancelRef.current?.focus();
+  }, [deleteCandidate]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
@@ -226,6 +237,36 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
     setStep("choose");
   };
 
+  const requestProfileDelete = (profile: Profile, returnFocus: HTMLElement): void => {
+    deleteReturnFocusRef.current = returnFocus;
+    setDeleteCandidate(profile);
+  };
+
+  const closeProfileDelete = (): void => {
+    setDeleteCandidate(undefined);
+    queueMicrotask(() => deleteReturnFocusRef.current?.focus());
+  };
+
+  const onDeleteDialogKeyDown = (event: React.KeyboardEvent<HTMLDivElement>): void => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeProfileDelete();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const buttons = [...(deleteDialogRef.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? [])];
+    if (buttons.length === 0) return;
+    const first = buttons[0]!;
+    const last = buttons[buttons.length - 1]!;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+
   const onProfileKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>, index: number): void => {
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
@@ -235,6 +276,9 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
     } else if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
       selectProfile(profiles[index]!);
+    } else if (event.key === "Delete") {
+      event.preventDefault();
+      requestProfileDelete(profiles[index]!, event.currentTarget);
     }
   };
 
@@ -252,18 +296,56 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
     const now = new Date().toISOString();
     const profile: Profile = {
       id: activeProfile?.id ?? crypto.randomUUID(),
-      name: profileName.trim() || `${text.source} → ${text.target}`,
+      name: profileName.trim(),
       sourcePath,
       targetPath,
       exclusions: activeProfile?.exclusions ?? defaultExclusions,
       createdAt: activeProfile?.createdAt ?? now,
       updatedAt: now,
     };
-    const saved = await gateway.saveProfile(profile);
-    setProfiles((current) => [saved, ...current.filter((entry) => entry.id !== saved.id)]);
-    setActiveProfile(saved);
-    setProfileName(saved.name);
-    syncCoordinator?.profileEdited();
+    const issue = validateSyncProfile(profile)[0];
+    if (issue) {
+      setError(issue.field === "name" ? text.profileNameInvalid : text.profileInvalid);
+      return;
+    }
+    setError(undefined);
+    try {
+      const saved = await gateway.saveProfile(profile);
+      setProfiles((current) => [saved, ...current.filter((entry) => entry.id !== saved.id)]);
+      setActiveProfile(saved);
+      setProfileName(saved.name);
+      syncCoordinator?.profileEdited();
+    } catch (unknownError) {
+      const failure = nativeFailure(unknownError);
+      setError(failure.code === "VALIDATION_FAILED" ? text.profileInvalid : text.genericError);
+    }
+  };
+
+  const deleteProfile = async (): Promise<void> => {
+    if (!deleteCandidate) return;
+    const deletedId = deleteCandidate.id;
+    try {
+      await gateway.deleteProfile(deletedId);
+      setProfiles((current) => current.filter((profile) => profile.id !== deletedId));
+      if (activeProfile?.id === deletedId) {
+        setActiveProfile(undefined);
+        setProfileName("");
+        setSourcePath("");
+        setTargetPath("");
+        setPlan(undefined);
+        setResult(undefined);
+        setRebind(null);
+        setStep("choose");
+      }
+      setDeleteCandidate(undefined);
+      setError(undefined);
+      syncCoordinator?.profileEdited();
+      queueMicrotask(() => newProfileRef.current?.focus());
+    } catch {
+      setDeleteCandidate(undefined);
+      setError(text.genericError);
+      queueMicrotask(() => deleteReturnFocusRef.current?.focus());
+    }
   };
 
   const createdCount = result?.directories.filter((entry) => entry.status === "created").length ?? 0;
@@ -296,7 +378,17 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
             </button>
           ))}
         </div>
-        <button className="new-profile" type="button" onClick={newProfile}><span aria-hidden="true">＋</span>{text.newProfile}</button>
+        <button ref={newProfileRef} className="new-profile" type="button" onClick={newProfile}><span aria-hidden="true">＋</span>{text.newProfile}</button>
+        {activeProfile ? (
+          <button
+            className="delete-profile"
+            type="button"
+            aria-label={text.deleteProfile(activeProfile.name)}
+            onClick={(event) => requestProfileDelete(activeProfile, event.currentTarget)}
+          >
+            <span aria-hidden="true">−</span>{text.deleteProfile(activeProfile.name)}
+          </button>
+        ) : null}
         <div className="rail-footer"><span className="offline-dot" aria-hidden="true" />{text.offline}</div>
       </aside>
 
@@ -312,7 +404,7 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
             </ol>
           </nav>
           <div className="topbar-actions">
-            {auth ? <AuthControls auth={auth} {...(syncCoordinator ? { coordinator: syncCoordinator } : {})} /> : null}
+            {auth ? <AuthControls auth={auth} locale={locale} {...(syncCoordinator ? { coordinator: syncCoordinator } : {})} /> : null}
             <button className="locale-button" type="button" onClick={() => setLocale(locale === "en" ? "vi" : "en")}>{text.localeButton}</button>
           </div>
         </header>
@@ -337,7 +429,14 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
               </div>
               <div className="profile-save">
                 <label htmlFor={profileNameId}>{text.profileName}</label>
-                <input id={profileNameId} value={profileName} onChange={(event) => setProfileName(event.currentTarget.value)} />
+                <input
+                  id={profileNameId}
+                  value={profileName}
+                  required
+                  minLength={PROFILE_LIMITS.name.min}
+                  maxLength={PROFILE_LIMITS.name.max}
+                  onChange={(event) => setProfileName(event.currentTarget.value)}
+                />
                 <button type="button" className="secondary-button" disabled={!sourcePath || !targetPath} onClick={() => void saveProfile()}>{text.save}</button>
               </div>
               <button ref={scanButtonRef} className="primary-button" type="button" disabled={!sourcePath || !targetPath} onClick={() => void scan()}>{text.scan}<span aria-hidden="true">↗</span></button>
@@ -409,6 +508,25 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
           ) : null}
         </div>
       </main>
+      {deleteCandidate ? (
+        <div className="modal-backdrop">
+          <div
+            ref={deleteDialogRef}
+            className="confirm-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={deleteDialogTitleId}
+            onKeyDown={onDeleteDialogKeyDown}
+          >
+            <h2 id={deleteDialogTitleId}>{text.deleteProfileTitle(deleteCandidate.name)}</h2>
+            <p>{text.deleteProfileBody}</p>
+            <div className="confirm-actions">
+              <button ref={deleteCancelRef} type="button" className="secondary-button" onClick={closeProfileDelete}>{text.cancelProfileDelete}</button>
+              <button type="button" className="danger-button" onClick={() => void deleteProfile()}>{text.confirmProfileDelete}</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -23,7 +23,7 @@ Because profiles contain absolute paths, they can reveal usernames, drive layout
 
 ## Retention and deletion
 
-Local profiles and capped run history remain until the user removes them or chooses local-data removal during sign-out/account removal. Hosted mutation receipts remain eligible for idempotent replay for 90 days. Expired receipts are eligible for cleanup after 90 days and are purged opportunistically on a later sync. Deleting account data removes hosted profiles, tombstones, changes, and receipts, then rotates the epoch so a stale device cannot silently restore them.
+Local profiles remain until the user deletes them or chooses local-profile removal during sign-out/account removal. Deleting local profiles does not delete the capped run history; run history remains local and ages out only through its bounded-history policy. Hosted mutation receipts are physically retained for 90 days. Expired receipt rows are eligible for cleanup after 90 days and are purged opportunistically on a later sync. A compact content-bound deduplication record remains for the lifetime of the account epoch so replaying an expired receipt cannot create another revision. Deleting hosted account data removes profiles, tombstones, changes, receipts, and that deduplication record, then rotates the epoch so a stale device cannot silently restore them.
 
 Production logs are metadata-only. Operators must not log bearer tokens, request bodies, profile fields, or absolute paths. Backups containing hosted profiles must be encrypted and governed by the deployment's retention policy.
 

@@ -17,6 +17,7 @@ import {
 
 export const OIDC_SCOPE = "openid profile email permissions offline_access";
 export const OIDC_REDIRECT_URI = "rootline://auth/callback";
+export const OIDC_BROWSER_FLOW_TIMEOUT_MS = 5 * 60 * 1000;
 
 export interface OidcConfiguration {
   authority: string;
@@ -41,6 +42,8 @@ export interface AuthSnapshot {
   accountClaimRequired?: boolean;
   epochResetRequired?: boolean;
   epochResetPreservesConsentedOutbox?: boolean;
+  signInPending?: boolean;
+  quarantinedMutations?: number;
   error?: string;
 }
 
@@ -49,6 +52,7 @@ export interface AuthController {
   subscribe(listener: (snapshot: AuthSnapshot) => void): () => void;
   initialize(): Promise<void>;
   signIn(): Promise<void>;
+  cancelSignIn(): Promise<void>;
   handleCallback(url: string): Promise<void>;
   signOut(removeLocalProfiles: boolean): Promise<void>;
   deleteAccountData(removeLocalProfiles: boolean): Promise<void>;
@@ -56,6 +60,12 @@ export interface AuthController {
   resolveAccountClaim(uploadExisting: boolean): Promise<void>;
   sync(): Promise<void>;
   dispose(): void;
+}
+
+function withoutAuthError(snapshot: AuthSnapshot): AuthSnapshot {
+  const next = { ...snapshot };
+  delete next.error;
+  return next;
 }
 
 interface Environment {
@@ -203,6 +213,9 @@ export class DesktopAuthController implements AuthController {
   private initializationFlight: { generation: number; promise: Promise<void> } | undefined;
   private callbackQueue: Promise<void> = Promise.resolve();
   private readonly processedCallbackStates = new Set<string>();
+  private signInTimer: ReturnType<typeof setTimeout> | undefined;
+  private signInGeneration = 0;
+  private signInStateCleanup: Promise<void> = Promise.resolve();
 
   constructor(private readonly config: OidcConfiguration, manager?: UserManager) {
     if (manager) {
@@ -263,17 +276,59 @@ export class DesktopAuthController implements AuthController {
   }
 
   async signIn(): Promise<void> {
-    this.update({ ...this.current, loading: true });
+    if (this.current.signInPending) await this.cancelSignIn();
+    this.clearSignInTimer();
+    const generation = ++this.signInGeneration;
+    this.update({ ...withoutAuthError(this.current), loading: true, signInPending: false });
     try {
+      await this.signInStateCleanup;
+      if (generation !== this.signInGeneration) return;
       await this.manager.signinRedirect({ nonce: crypto.randomUUID() });
+      if (generation !== this.signInGeneration) return;
+      this.update({ ...withoutAuthError(this.current), loading: false, signInPending: true });
+      this.signInTimer = setTimeout(() => {
+        if (generation !== this.signInGeneration) return;
+        this.signInTimer = undefined;
+        this.update({ ...this.current, loading: false, signInPending: false, error: "AUTH_SIGNIN_TIMEOUT" });
+        void this.queueSignInStateDiscard();
+      }, OIDC_BROWSER_FLOW_TIMEOUT_MS);
     } catch (error) {
-      this.update({
-        ...this.current,
-        loading: false,
-        error: error instanceof Error ? error.message : "The system browser could not be opened.",
-      });
+      if (generation === this.signInGeneration) {
+        this.update({
+          ...this.current,
+          loading: false,
+          signInPending: false,
+          error: error instanceof Error ? error.message : "The system browser could not be opened.",
+        });
+      }
       throw error;
     }
+  }
+
+  private clearSignInTimer(): void {
+    if (this.signInTimer) clearTimeout(this.signInTimer);
+    this.signInTimer = undefined;
+  }
+
+  private async discardSignInState(): Promise<void> {
+    try {
+      const keys = await this.manager.settings.stateStore.getAllKeys();
+      await Promise.all(keys.map((key) => this.manager.settings.stateStore.remove(key)));
+    } catch {
+      try { await this.manager.clearStaleState(); } catch { /* best-effort protocol-state cleanup */ }
+    }
+  }
+
+  private queueSignInStateDiscard(): Promise<void> {
+    this.signInStateCleanup = this.signInStateCleanup.then(() => this.discardSignInState());
+    return this.signInStateCleanup;
+  }
+
+  async cancelSignIn(): Promise<void> {
+    this.signInGeneration += 1;
+    this.clearSignInTimer();
+    this.update({ ...withoutAuthError(this.current), loading: false, signInPending: false });
+    await this.queueSignInStateDiscard();
   }
 
   handleCallback(rawUrl: string): Promise<void> {
@@ -289,12 +344,15 @@ export class DesktopAuthController implements AuthController {
       if (this.processedCallbackStates.has(state)) return;
       this.processedCallbackStates.add(state);
       const user = await this.manager.signinRedirectCallback(url.toString());
-      this.update({ configured: true, loading: false, user: projectUser(user), dataVersion: this.current.dataVersion });
+      this.signInGeneration += 1;
+      this.clearSignInTimer();
+      this.update({ configured: true, loading: false, signInPending: false, user: projectUser(user), dataVersion: this.current.dataVersion });
       try { await this.sync(); } catch { /* sync() already surfaces reset-required; offline sign-in remains valid */ }
     } catch (error) {
       this.update({
         configured: true,
         loading: false,
+        signInPending: false,
         user: this.current.user,
         dataVersion: this.current.dataVersion,
         error: error instanceof Error ? error.message : "Authentication failed.",
@@ -303,6 +361,8 @@ export class DesktopAuthController implements AuthController {
   }
 
   async signOut(removeLocalProfiles: boolean): Promise<void> {
+    this.signInGeneration += 1;
+    this.clearSignInTimer();
     try { await this.manager.revokeTokens(["access_token", "refresh_token"]); } catch { /* local sign-out must still complete offline */ }
     await this.manager.removeUser();
     await invoke("disconnect_hosted_account", { removeLocalProfiles });
@@ -319,7 +379,9 @@ export class DesktopAuthController implements AuthController {
       subject: user.profile.sub,
       removeLocalProfiles,
     });
-    this.update({ ...this.current, dataVersion: this.current.dataVersion + 1 });
+    const next = { ...this.current, dataVersion: this.current.dataVersion + 1 };
+    if (removeLocalProfiles) delete next.quarantinedMutations;
+    this.update(next);
   }
 
   async resolveEpochReset(removeLocalProfiles: boolean): Promise<void> {
@@ -356,8 +418,14 @@ export class DesktopAuthController implements AuthController {
     const user = await this.manager.getUser();
     if (!user || user.expired || !user.access_token || typeof user.profile.sub !== "string") return;
     try {
-      await invoke("sync_hosted_profiles", { apiUrl: this.config.apiUrl, accessToken: user.access_token, subject: user.profile.sub });
-      this.update({ ...this.current, dataVersion: this.current.dataVersion + 1 });
+      const outcome = await invoke<{ quarantinedMutations?: unknown }>("sync_hosted_profiles", { apiUrl: this.config.apiUrl, accessToken: user.access_token, subject: user.profile.sub });
+      const quarantinedMutations = typeof outcome?.quarantinedMutations === "number" && outcome.quarantinedMutations > 0
+        ? outcome.quarantinedMutations
+        : undefined;
+      const next: AuthSnapshot = { ...this.current, dataVersion: this.current.dataVersion + 1 };
+      if (quarantinedMutations === undefined) delete next.quarantinedMutations;
+      else next.quarantinedMutations = quarantinedMutations;
+      this.update(next);
     } catch (error) {
       const value = error as { code?: unknown; message?: unknown; details?: { epoch?: unknown; preservesConsentedOutbox?: unknown } };
       if (value?.code === "SYNC_EPOCH_RESET_REQUIRED" && typeof value.details?.epoch === "string") {
@@ -382,6 +450,8 @@ export class DesktopAuthController implements AuthController {
   }
 
   dispose(): void {
+    this.signInGeneration += 1;
+    this.clearSignInTimer();
     this.initialization += 1;
     this.initialized = false;
     this.initializationFlight = undefined;
@@ -395,6 +465,7 @@ class LocalAuthController implements AuthController {
   subscribe(listener: (snapshot: AuthSnapshot) => void) { listener(this.value); return () => undefined; }
   initialize() { return Promise.resolve(); }
   signIn() { return Promise.resolve(); }
+  cancelSignIn() { return Promise.resolve(); }
   handleCallback() { return Promise.resolve(); }
   signOut(removeLocalProfiles: boolean) { return removeLocalProfiles ? invoke<void>("clear_local_synced_data") : Promise.resolve(); }
   deleteAccountData(removeLocalProfiles: boolean) { return removeLocalProfiles ? invoke<void>("clear_local_synced_data") : Promise.resolve(); }

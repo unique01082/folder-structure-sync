@@ -1,14 +1,20 @@
 import { Type } from "class-transformer";
+import { PROFILE_LIMITS } from "@rootline/contracts";
 import {
   ArrayMaxSize, IsArray, IsDateString, IsIn, IsOptional, IsString, IsUUID, MaxLength, MinLength, ValidateNested,
 } from "class-validator";
 
 export class SyncProfileDto {
   @IsString() @MinLength(1) @MaxLength(128) id!: string;
-  @IsString() @MinLength(1) @MaxLength(120) name!: string;
-  @IsString() @MinLength(1) @MaxLength(4096) sourcePath!: string;
-  @IsString() @MinLength(1) @MaxLength(4096) targetPath!: string;
-  @IsArray() @ArrayMaxSize(100) @IsString({ each: true }) @MaxLength(512, { each: true }) exclusions!: string[];
+  @IsString() @MinLength(PROFILE_LIMITS.name.min) @MaxLength(PROFILE_LIMITS.name.max) name!: string;
+  @IsString() @MinLength(PROFILE_LIMITS.path.min) @MaxLength(PROFILE_LIMITS.path.max) sourcePath!: string;
+  @IsString() @MinLength(PROFILE_LIMITS.path.min) @MaxLength(PROFILE_LIMITS.path.max) targetPath!: string;
+  @IsArray()
+  @ArrayMaxSize(PROFILE_LIMITS.exclusions.max)
+  @IsString({ each: true })
+  @MinLength(PROFILE_LIMITS.exclusions.pattern.min, { each: true })
+  @MaxLength(PROFILE_LIMITS.exclusions.pattern.max, { each: true })
+  exclusions!: string[];
   @IsDateString() createdAt!: string;
   @IsDateString() updatedAt!: string;
   @IsOptional() @IsIn(["additive"]) syncMode?: "additive";

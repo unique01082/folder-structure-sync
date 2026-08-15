@@ -46,4 +46,36 @@ describe("Rootline contracts", () => {
     expect(contracts.CLOUD_MUTATION_KINDS).toEqual(["upsert", "delete"]);
     expect(contracts.PROFILE_RECORD_KINDS).toEqual(["profile", "tombstone"]);
   });
+
+  it("exports the exact shared profile limits and runtime validation", () => {
+    expect(contracts.PROFILE_LIMITS).toEqual({
+      name: { min: 1, max: 80 },
+      path: { min: 1, max: 4096 },
+      exclusions: { max: 100, pattern: { min: 1, max: 256 } },
+    });
+    const valid = {
+      id: "profile",
+      name: "n".repeat(80),
+      sourcePath: "/".repeat(4096),
+      targetPath: "C".repeat(4096),
+      exclusions: Array.from({ length: 100 }, () => "x".repeat(256)),
+      createdAt: "2026-08-15T00:00:00Z",
+      updatedAt: "2026-08-15T00:00:00Z",
+    };
+    expect(contracts.validateSyncProfile(valid)).toEqual([]);
+    expect(contracts.validateSyncProfile({
+      ...valid,
+      name: "n".repeat(81),
+      sourcePath: "",
+      targetPath: "t".repeat(4097),
+      exclusions: [...valid.exclusions, "", "x".repeat(257)],
+    })).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: "name" }),
+      expect.objectContaining({ field: "sourcePath" }),
+      expect.objectContaining({ field: "targetPath" }),
+      expect.objectContaining({ field: "exclusions" }),
+      expect.objectContaining({ field: "exclusions[100]" }),
+      expect.objectContaining({ field: "exclusions[101]" }),
+    ]));
+  });
 });

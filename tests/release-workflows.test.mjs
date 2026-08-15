@@ -29,6 +29,26 @@ test("all workflows are valid YAML", () => {
   }
 });
 
+test("production dependency audits fail closed before CI and every release mutation", () => {
+  const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+  assert.equal(manifest.scripts["audit:prod"], "pnpm audit --prod --audit-level high");
+  assert.equal(manifest.pnpm.overrides["js-yaml@>=5.0.0 <=5.2.1"], "5.2.2");
+
+  for (const name of workflows) {
+    assert.match(workflow(name), /pnpm audit --prod --audit-level high/, `${name} must enforce the production audit`);
+  }
+  const npmRelease = workflow("release-npm.yml");
+  const apiRelease = workflow("release-api.yml");
+  const desktopRelease = workflow("release-desktop.yml");
+  assert.ok(npmRelease.indexOf("pnpm audit --prod --audit-level high") < npmRelease.indexOf("npm publish"));
+  assert.ok(apiRelease.indexOf("pnpm audit --prod --audit-level high") < apiRelease.indexOf("docker/build-push-action"));
+  assert.ok(desktopRelease.indexOf("pnpm audit --prod --audit-level high") < desktopRelease.indexOf("tauri signer sign"));
+
+  const lockfile = readFileSync(join(root, "pnpm-lock.yaml"), "utf8");
+  assert.match(lockfile, /js-yaml@5\.2\.2/);
+  assert.doesNotMatch(lockfile, /js-yaml@5\.2\.1/);
+});
+
 test("every third-party action is pinned to a full immutable commit SHA", () => {
   for (const name of workflows) {
     const actionReferences = [...workflow(name).matchAll(/uses:\s*([\w.-]+\/[\w.-]+)@([^\s#]+)/g)];

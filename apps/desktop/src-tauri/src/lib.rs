@@ -1,11 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -34,6 +33,7 @@ pub enum NativeErrorCode {
     SyncEpochResetRequired,
     SyncAccountClaimRequired,
     SyncStateChanged,
+    ValidationFailed,
     Internal,
 }
 
@@ -242,7 +242,7 @@ fn absolute(path: &Path) -> Result<PathBuf, NativeError> {
 }
 
 fn canonical_directory(path: &Path, role: &str) -> Result<PathBuf, NativeError> {
-    assert_not_link(path)?;
+    assert_no_link_ancestors(path)?;
     let canonical = fs::canonicalize(path).map_err(|error| {
         let code = if error.kind() == std::io::ErrorKind::NotFound {
             if role == "source" {
@@ -263,6 +263,56 @@ fn canonical_directory(path: &Path, role: &str) -> Result<PathBuf, NativeError> 
         ));
     }
     Ok(canonical)
+}
+
+fn assert_no_link_ancestors(path: &Path) -> Result<(), NativeError> {
+    let absolute = absolute(path)?;
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata)
+                if is_link_or_junction(&metadata) && !is_allowed_platform_root_alias(&current) =>
+            {
+                return Err(NativeError {
+                    code: NativeErrorCode::InvalidPath,
+                    message:
+                        "A synchronization root must not traverse a symbolic link or junction."
+                            .into(),
+                    details: Some(json!({ "path": absolute, "linkedAncestor": current })),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(NativeError::at(
+                    NativeErrorCode::UnreadablePath,
+                    error.to_string(),
+                    &current,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn is_allowed_platform_root_alias(path: &Path) -> bool {
+    let expected = if path == Path::new("/var") {
+        Some(Path::new("/private/var"))
+    } else if path == Path::new("/tmp") {
+        Some(Path::new("/private/tmp"))
+    } else if path == Path::new("/etc") {
+        Some(Path::new("/private/etc"))
+    } else {
+        None
+    };
+    expected.is_some_and(|expected| fs::canonicalize(path).is_ok_and(|actual| actual == expected))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_allowed_platform_root_alias(_path: &Path) -> bool {
+    false
 }
 
 fn assert_not_link(path: &Path) -> Result<(), NativeError> {
@@ -341,30 +391,150 @@ fn validate_relationship(
     Ok(())
 }
 
+fn nearest_existing_ancestor(path: &Path) -> Result<PathBuf, NativeError> {
+    let mut current = absolute(path)?;
+    loop {
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_dir() => return Ok(current),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(NativeError::at(
+                    NativeErrorCode::UnreadablePath,
+                    error.to_string(),
+                    &current,
+                ));
+            }
+        }
+        if !current.pop() {
+            return Err(NativeError::at(
+                NativeErrorCode::InvalidPath,
+                "The path has no existing directory ancestor.",
+                path,
+            ));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn case_sensitive_from_os(directory: &Path) -> Result<bool, NativeError> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    #[repr(C)]
+    struct VolumeCapabilitiesBuffer {
+        length: u32,
+        capabilities: [u32; 4],
+        valid: [u32; 4],
+    }
+
+    let path = CString::new(directory.as_os_str().as_bytes()).map_err(|_| {
+        NativeError::at(
+            NativeErrorCode::InvalidPath,
+            "The target path contains a null byte.",
+            directory,
+        )
+    })?;
+    let mut attributes = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_CAPABILITIES,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut buffer = VolumeCapabilitiesBuffer {
+        length: 0,
+        capabilities: [0; 4],
+        valid: [0; 4],
+    };
+    // SAFETY: `path`, `attributes`, and `buffer` remain valid for this synchronous
+    // call, and the buffer exactly matches the requested fixed-size volume attribute.
+    let result = unsafe {
+        libc::getattrlist(
+            path.as_ptr(),
+            (&mut attributes as *mut libc::attrlist).cast(),
+            (&mut buffer as *mut VolumeCapabilitiesBuffer).cast(),
+            std::mem::size_of::<VolumeCapabilitiesBuffer>(),
+            0,
+        )
+    };
+    if result != 0 {
+        return Err(NativeError::at(
+            NativeErrorCode::UnreadablePath,
+            std::io::Error::last_os_error().to_string(),
+            directory,
+        ));
+    }
+    let capability = libc::VOL_CAP_FMT_CASE_SENSITIVE;
+    Ok(buffer.valid[0] & capability != 0 && buffer.capabilities[0] & capability != 0)
+}
+
+#[cfg(windows)]
+fn case_sensitive_from_os(directory: &Path) -> Result<bool, NativeError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            CreateFileW, FileCaseSensitiveInfo, GetFileInformationByHandleEx,
+            FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        },
+    };
+
+    let wide = directory
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: the UTF-16 path is null-terminated and all other arguments are constants/null.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(NativeError::at(
+            NativeErrorCode::UnreadablePath,
+            std::io::Error::last_os_error().to_string(),
+            directory,
+        ));
+    }
+    let mut information = FILE_CASE_SENSITIVE_INFO::default();
+    // SAFETY: `handle` is live and `information` is the exact structure requested.
+    let result = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileCaseSensitiveInfo,
+            (&mut information as *mut FILE_CASE_SENSITIVE_INFO).cast(),
+            std::mem::size_of::<FILE_CASE_SENSITIVE_INFO>() as u32,
+        )
+    };
+    // SAFETY: the handle came from CreateFileW and is closed exactly once here.
+    unsafe { CloseHandle(handle) };
+    if result == 0 {
+        return Err(NativeError::at(
+            NativeErrorCode::UnreadablePath,
+            std::io::Error::last_os_error().to_string(),
+            directory,
+        ));
+    }
+    Ok(information.Flags & 1 != 0)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn case_sensitive_from_os(_directory: &Path) -> Result<bool, NativeError> {
+    Ok(true)
+}
+
 pub fn detect_case_sensitive(directory: &Path) -> Result<bool, NativeError> {
-    let probe_name = format!(".rootline-case-probe-{}", Uuid::new_v4().simple());
-    let probe = directory.join(&probe_name);
-    let alternate = directory.join(probe_name.to_uppercase());
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-        .map_err(|error| {
-            NativeError::at(
-                NativeErrorCode::UnreadablePath,
-                error.to_string(),
-                directory,
-            )
-        })?;
-    let outcome = (|| {
-        file.write_all(b"rootline").map_err(|error| {
-            NativeError::at(NativeErrorCode::UnreadablePath, error.to_string(), &probe)
-        })?;
-        Ok(!alternate.exists())
-    })();
-    drop(file);
-    let _ = fs::remove_file(probe);
-    outcome
+    case_sensitive_from_os(&nearest_existing_ancestor(directory)?)
 }
 
 fn normalize_relative(path: &Path) -> String {
@@ -478,6 +648,7 @@ pub fn scan_plan(
     token.check()?;
     let source = canonical_directory(&request.source_path, "source")?;
     let target = canonical_directory(&request.target_path, "target")?;
+    validate_relationship(&source, &target, !cfg!(any(target_os = "macos", windows)))?;
     let target_case_sensitive = detect_case_sensitive(&target)?;
     validate_relationship(&source, &target, target_case_sensitive)?;
     let source_snapshot = scan_root(&source, &request.exclusions, token)?;
@@ -663,6 +834,180 @@ pub struct Profile {
     pub updated_at: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CharacterLimits {
+    min: usize,
+    max: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExclusionLimits {
+    max: usize,
+    pattern: CharacterLimits,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProfileLimits {
+    name: CharacterLimits,
+    path: CharacterLimits,
+    exclusions: ExclusionLimits,
+}
+
+fn profile_limits() -> &'static ProfileLimits {
+    static LIMITS: OnceLock<ProfileLimits> = OnceLock::new();
+    LIMITS.get_or_init(|| {
+        serde_json::from_str(include_str!(
+            "../../../../packages/contracts/src/profile-limits.json"
+        ))
+        .expect("shared profile limits must be valid JSON")
+    })
+}
+
+fn profile_validation_error(field: &str, min: Option<usize>, max: usize) -> NativeError {
+    NativeError {
+        code: NativeErrorCode::ValidationFailed,
+        message: "The profile exceeds Rootline's hosted profile limits.".into(),
+        details: Some(json!({ "field": field, "min": min, "max": max })),
+    }
+}
+
+fn validate_profile(profile: &Profile) -> Result<(), NativeError> {
+    let id_length = profile.id.chars().count();
+    if !(1..=128).contains(&id_length) {
+        return Err(profile_validation_error("id", Some(1), 128));
+    }
+    let limits = profile_limits();
+    for (field, value, limit) in [
+        ("name", profile.name.as_str(), &limits.name),
+        ("sourcePath", profile.source_path.as_str(), &limits.path),
+        ("targetPath", profile.target_path.as_str(), &limits.path),
+    ] {
+        let length = value.chars().count();
+        if length < limit.min || length > limit.max {
+            return Err(profile_validation_error(field, Some(limit.min), limit.max));
+        }
+    }
+    if profile.exclusions.len() > limits.exclusions.max {
+        return Err(profile_validation_error(
+            "exclusions",
+            None,
+            limits.exclusions.max,
+        ));
+    }
+    for (index, pattern) in profile.exclusions.iter().enumerate() {
+        let length = pattern.chars().count();
+        let limit = &limits.exclusions.pattern;
+        if length < limit.min || length > limit.max {
+            return Err(profile_validation_error(
+                &format!("exclusions[{index}]"),
+                Some(limit.min),
+                limit.max,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn outbox_validation_error(
+    mutation_id: &str,
+    kind: &str,
+    payload: &str,
+    occurred_at: &str,
+) -> Option<String> {
+    if Uuid::parse_str(mutation_id).is_err() {
+        return Some("mutationId is not a UUID".into());
+    }
+    if OffsetDateTime::parse(occurred_at, &Rfc3339).is_err() {
+        return Some("occurredAt is not an RFC 3339 timestamp".into());
+    }
+    match kind {
+        "upsert" => {
+            let profile: Profile = match serde_json::from_str(payload) {
+                Ok(profile) => profile,
+                Err(_) => return Some("profile payload is invalid JSON".into()),
+            };
+            if OffsetDateTime::parse(&profile.created_at, &Rfc3339).is_err()
+                || OffsetDateTime::parse(&profile.updated_at, &Rfc3339).is_err()
+            {
+                return Some("profile timestamps are invalid".into());
+            }
+            validate_profile(&profile).err().map(|error| {
+                let field = error
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("field"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("profile");
+                format!("profile {field} exceeds the hosted limit")
+            })
+        }
+        "delete" => {
+            let profile_id = serde_json::from_str::<serde_json::Value>(payload)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("profileId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                });
+            match profile_id {
+                Some(profile_id) if (1..=128).contains(&profile_id.chars().count()) => None,
+                _ => Some("delete profileId is invalid".into()),
+            }
+        }
+        _ => Some("mutation kind is invalid".into()),
+    }
+}
+
+fn quarantine_invalid_outbox(connection: &mut Connection) -> Result<usize, NativeError> {
+    let candidates = {
+        let mut statement = connection.prepare(
+            "SELECT sequence, mutation_id, kind, payload, occurred_at, profile_id
+             FROM mutation_outbox ORDER BY sequence ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let transaction = connection.transaction()?;
+    let mut quarantined = 0;
+    for (sequence, mutation_id, kind, payload, occurred_at, profile_id) in candidates {
+        let Some(reason) = outbox_validation_error(&mutation_id, &kind, &payload, &occurred_at)
+        else {
+            continue;
+        };
+        transaction.execute(
+            "INSERT INTO mutation_quarantine(mutation_id, kind, profile_id, reason)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(mutation_id) DO UPDATE SET kind=excluded.kind,
+               profile_id=excluded.profile_id, reason=excluded.reason,
+               quarantined_at=CURRENT_TIMESTAMP",
+            params![mutation_id, kind, profile_id, reason],
+        )?;
+        transaction.execute(
+            "DELETE FROM mutation_outbox WHERE sequence = ?1",
+            [sequence],
+        )?;
+        quarantined += 1;
+    }
+    if quarantined > 0 {
+        transaction.execute(
+            "UPDATE sync_state SET session_generation=session_generation + 1 WHERE singleton=1",
+            [],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(quarantined)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutboxMutation {
@@ -670,6 +1015,14 @@ pub struct OutboxMutation {
     pub kind: String,
     pub payload: String,
     pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuarantinedMutation {
+    pub mutation_id: String,
+    pub profile_id: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -702,6 +1055,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         5,
         include_str!("../migrations/0005_sync_lifecycle_generation.sql"),
     ),
+    (
+        6,
+        include_str!("../migrations/0006_invalid_outbox_quarantine.sql"),
+    ),
 ];
 const HOSTED_SYNC_MUTATION_LIMIT: usize = 100;
 const HOSTED_SYNC_BODY_LIMIT: usize = 256 * 1024;
@@ -731,6 +1088,7 @@ impl Database {
             )?;
             transaction.commit()?;
         }
+        quarantine_invalid_outbox(&mut connection)?;
         Ok(Self(Mutex::new(connection)))
     }
 
@@ -759,6 +1117,7 @@ impl Database {
     }
 
     pub fn save_profile(&self, profile: &Profile) -> Result<(), NativeError> {
+        validate_profile(profile)?;
         let payload = serde_json::to_string(profile)
             .map_err(|error| NativeError::new(NativeErrorCode::Internal, error.to_string()))?;
         let mut connection = self.connection();
@@ -771,6 +1130,10 @@ impl Database {
             params![profile.id, profile.name, profile.source_path, profile.target_path,
                 serde_json::to_string(&profile.exclusions).map_err(|error| NativeError::new(NativeErrorCode::Internal, error.to_string()))?,
                 profile.created_at, profile.updated_at],
+        )?;
+        transaction.execute(
+            "DELETE FROM mutation_quarantine WHERE profile_id = ?1",
+            [&profile.id],
         )?;
         transaction.execute(
             "INSERT INTO mutation_outbox(
@@ -819,6 +1182,10 @@ impl Database {
         let mut connection = self.connection();
         let transaction = connection.transaction()?;
         transaction.execute("DELETE FROM profiles WHERE id = ?1", [id])?;
+        transaction.execute(
+            "DELETE FROM mutation_quarantine WHERE profile_id = ?1",
+            [id],
+        )?;
         transaction.execute(
             "INSERT INTO mutation_outbox(
                mutation_id, kind, payload, occurred_at, profile_id, preserve_on_epoch_adopt
@@ -883,6 +1250,22 @@ impl Database {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn quarantined_mutations(&self) -> Result<Vec<QuarantinedMutation>, NativeError> {
+        let connection = self.connection();
+        let mut statement = connection.prepare(
+            "SELECT mutation_id, profile_id, reason
+             FROM mutation_quarantine ORDER BY sequence ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(QuarantinedMutation {
+                mutation_id: row.get(0)?,
+                profile_id: row.get(1)?,
+                reason: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn acknowledge_mutations(&self, ids: &[String]) -> Result<(), NativeError> {
         let mut connection = self.connection();
         let transaction = connection.transaction()?;
@@ -932,6 +1315,7 @@ impl Database {
         let transaction = connection.transaction()?;
         transaction.execute("DELETE FROM profiles", [])?;
         transaction.execute("DELETE FROM mutation_outbox", [])?;
+        transaction.execute("DELETE FROM mutation_quarantine", [])?;
         transaction.execute("DELETE FROM sync_state", [])?;
         transaction.commit()?;
         Ok(())
@@ -956,6 +1340,7 @@ impl Database {
         )?;
         if remove_local_profiles {
             transaction.execute("DELETE FROM profiles", [])?;
+            transaction.execute("DELETE FROM mutation_quarantine", [])?;
         }
         transaction.commit()?;
         Ok(())
@@ -1050,6 +1435,7 @@ impl Database {
         }
         if remove_local_profiles {
             transaction.execute("DELETE FROM profiles", [])?;
+            transaction.execute("DELETE FROM mutation_quarantine", [])?;
         }
         let lifecycle_generation = Uuid::new_v4().to_string();
         transaction.execute(
@@ -1120,6 +1506,7 @@ impl Database {
         transaction.execute("DELETE FROM mutation_outbox", [])?;
         if remove_local_profiles {
             transaction.execute("DELETE FROM profiles", [])?;
+            transaction.execute("DELETE FROM mutation_quarantine", [])?;
         }
         let lifecycle_generation = Uuid::new_v4().to_string();
         transaction.execute(
@@ -1144,7 +1531,8 @@ impl Database {
         subject: &str,
         expected_lifecycle_generation: Option<&str>,
     ) -> Result<(serde_json::Value, String), NativeError> {
-        let connection = self.connection();
+        let mut connection = self.connection();
+        quarantine_invalid_outbox(&mut connection)?;
         let device_id: String = match connection
             .query_row(
                 "SELECT value FROM settings WHERE key='device_id'",
@@ -1455,6 +1843,7 @@ impl Database {
                         })?,
                     )
                     .map_err(internal_error)?;
+                    validate_profile(&profile)?;
                     let has_pending_local_mutation: i64 = transaction.query_row(
                         "SELECT EXISTS(SELECT 1 FROM mutation_outbox WHERE profile_id=?1)",
                         [&profile.id],
@@ -1668,11 +2057,52 @@ fn delete_profile(id: String, database: State<'_, Database>) -> Result<(), Nativ
 struct HostedSyncOutcome {
     acknowledged: usize,
     records_applied: usize,
+    quarantined_mutations: usize,
     cursor: String,
 }
 
 #[derive(Default)]
 struct HostedSyncLock(tokio::sync::Mutex<()>);
+
+fn validate_exact_receipt_ids(
+    response: &serde_json::Value,
+    sent_ids: &HashSet<String>,
+) -> Result<usize, NativeError> {
+    let receipts = response
+        .get("receipts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "Hosted sync returned invalid mutation receipts; local data remains queued.",
+            )
+        })?;
+    let mut received_ids = HashSet::with_capacity(receipts.len());
+    for receipt in receipts {
+        let mutation_id = receipt
+            .get("mutationId")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "Hosted sync returned an invalid mutation receipt; local data remains queued.",
+                )
+            })?;
+        if !received_ids.insert(mutation_id.to_owned()) {
+            return Err(NativeError::new(
+                NativeErrorCode::Internal,
+                "Hosted sync returned duplicate mutation receipts; local data remains queued.",
+            ));
+        }
+    }
+    if &received_ids != sent_ids {
+        return Err(NativeError::new(
+            NativeErrorCode::Internal,
+            "Hosted sync receipts did not exactly match the sent mutations; local data remains queued.",
+        ));
+    }
+    Ok(receipts.len())
+}
 
 async fn run_hosted_sync_loop<Send, Response>(
     database: &Database,
@@ -1749,6 +2179,7 @@ where
                 "Hosted sync was rejected; local data remains safe.",
             ));
         }
+        let receipt_count = validate_exact_receipt_ids(&body, &sent_ids)?;
         let response_cursor = body
             .get("cursor")
             .and_then(serde_json::Value::as_str)
@@ -1775,10 +2206,7 @@ where
             }
             Err(error) => return Err(error),
         }
-        acknowledged += body
-            .get("receipts")
-            .and_then(serde_json::Value::as_array)
-            .map_or(0, Vec::len);
+        acknowledged += receipt_count;
         records_applied += body
             .get("records")
             .and_then(serde_json::Value::as_array)
@@ -1812,6 +2240,7 @@ where
     Ok(HostedSyncOutcome {
         acknowledged,
         records_applied,
+        quarantined_mutations: database.quarantined_mutations()?.len(),
         cursor,
     })
 }
@@ -2453,6 +2882,155 @@ mod tests {
                 "Edited during request"
             );
             assert!(database.pending_outbox().unwrap().is_empty());
+        });
+    }
+
+    fn assert_invalid_receipt_set_preserves_outbox(fault: &str) {
+        tauri::async_runtime::block_on(async {
+            let directory = tempdir().unwrap();
+            let database = Database::open(
+                directory
+                    .path()
+                    .join(format!("invalid-{fault}-receipts.sqlite3")),
+            )
+            .unwrap();
+            for index in 0..101 {
+                database
+                    .enqueue_mutation(
+                        &format!("00000000-0000-4000-8006-{index:012}"),
+                        "upsert",
+                        &json!({
+                            "id": format!("profile-{index}"),
+                            "name": format!("Profile {index}"),
+                            "sourcePath": format!("/source/{index}"),
+                            "targetPath": format!("/target/{index}"),
+                            "exclusions": [],
+                            "createdAt": "2026-08-15T00:00:00Z",
+                            "updatedAt": "2026-08-15T00:00:00Z"
+                        })
+                        .to_string(),
+                        "2026-08-15T00:00:00Z",
+                    )
+                    .unwrap();
+            }
+            database.claim_hosted_account("alice", true).unwrap();
+            let before = database.pending_outbox().unwrap();
+            let before_cursor = database.sync_cursor().unwrap();
+            let sends = Arc::new(AtomicUsize::new(0));
+            let counted_sends = Arc::clone(&sends);
+            let fault = fault.to_owned();
+
+            let error = run_hosted_sync_loop(&database, "alice", move |payload| {
+                let attempt = counted_sends.fetch_add(1, Ordering::SeqCst);
+                let fault = fault.clone();
+                async move {
+                    if attempt > 0 {
+                        return Err(NativeError::new(
+                            NativeErrorCode::Internal,
+                            "Transport was reused after an invalid receipt set.",
+                        ));
+                    }
+                    let mutations = payload["mutations"].as_array().unwrap();
+                    assert_eq!(mutations.len(), 100);
+                    let mut receipts = mutations
+                        .iter()
+                        .enumerate()
+                        .map(|(index, mutation)| {
+                            json!({ "mutationId": mutation["mutationId"], "revision": index + 1 })
+                        })
+                        .collect::<Vec<_>>();
+                    match fault.as_str() {
+                        "missing" => {
+                            receipts.pop();
+                        }
+                        "duplicate" => receipts.push(receipts[0].clone()),
+                        "extra-101" => receipts.push(json!({
+                            "mutationId": "00000000-0000-4000-8006-000000000100",
+                            "revision": 101
+                        })),
+                        _ => unreachable!(),
+                    }
+                    Ok((
+                        reqwest::StatusCode::OK,
+                        json!({
+                            "epoch": payload["epoch"],
+                            "cursor": "must-not-commit",
+                            "hasMore": false,
+                            "records": [],
+                            "receipts": receipts
+                        }),
+                    ))
+                }
+            })
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.code, NativeErrorCode::Internal);
+            assert_eq!(sends.load(Ordering::SeqCst), 1);
+            assert_eq!(database.pending_outbox().unwrap(), before);
+            assert_eq!(database.sync_cursor().unwrap(), before_cursor);
+        });
+    }
+
+    #[test]
+    fn command_loop_rejects_missing_receipts_before_mutating_sqlite() {
+        assert_invalid_receipt_set_preserves_outbox("missing");
+    }
+
+    #[test]
+    fn command_loop_rejects_duplicate_receipts_before_mutating_sqlite() {
+        assert_invalid_receipt_set_preserves_outbox("duplicate");
+    }
+
+    #[test]
+    fn command_loop_rejects_an_extra_101st_receipt_before_mutating_sqlite() {
+        assert_invalid_receipt_set_preserves_outbox("extra-101");
+    }
+
+    #[test]
+    fn command_loop_reports_quarantined_legacy_mutations_without_fifo_wedging() {
+        tauri::async_runtime::block_on(async {
+            let directory = tempdir().unwrap();
+            let database =
+                Database::open(directory.path().join("quarantine-status.sqlite3")).unwrap();
+            database
+                .enqueue_mutation(
+                    "00000000-0000-4000-8007-000000000010",
+                    "upsert",
+                    &json!({
+                        "id": "legacy-invalid",
+                        "name": "n".repeat(81),
+                        "sourcePath": "/source",
+                        "targetPath": "/target",
+                        "exclusions": [],
+                        "createdAt": "2026-08-15T00:00:00Z",
+                        "updatedAt": "2026-08-15T00:00:00Z"
+                    })
+                    .to_string(),
+                    "2026-08-15T00:00:00Z",
+                )
+                .unwrap();
+            database.claim_hosted_account("alice", true).unwrap();
+
+            let outcome = run_hosted_sync_loop(&database, "alice", |payload| async move {
+                assert_eq!(payload["mutations"], json!([]));
+                Ok((
+                    reqwest::StatusCode::OK,
+                    json!({
+                        "epoch": payload["epoch"],
+                        "cursor": "quarantine-observed",
+                        "hasMore": false,
+                        "records": [],
+                        "receipts": []
+                    }),
+                ))
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(outcome.quarantined_mutations, 1);
+            assert!(database.pending_outbox().unwrap().is_empty());
+            assert_eq!(database.quarantined_mutations().unwrap().len(), 1);
         });
     }
 }

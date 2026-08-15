@@ -3,6 +3,7 @@ import { OidcClient, WebStorageStateStore, type AsyncStorage } from "oidc-client
 
 import {
   DesktopAuthController,
+  OIDC_BROWSER_FLOW_TIMEOUT_MS,
   OIDC_SCOPE,
   ProfileSyncCoordinator,
   createOidcSettings,
@@ -244,6 +245,56 @@ describe("Rootline desktop authentication boundary", () => {
     expect(auth.snapshot()).toEqual(expect.objectContaining({ loading: false, user: null, error: "system browser unavailable" }));
   });
 
+  test("lets an abandoned browser sign-in time out, cancel, and retry without a stuck loading state", async () => {
+    vi.useFakeTimers();
+    const stateStore = {
+      getAllKeys: vi.fn(async () => ["pending-state"]),
+      remove: vi.fn(async () => "stored-request"),
+    };
+    const manager = {
+      settings: { stateStore },
+      getUser: vi.fn(async () => null),
+      signinRedirect: vi.fn(async () => undefined),
+      signinRedirectCallback: vi.fn(),
+      clearStaleState: vi.fn(async () => undefined),
+      revokeTokens: vi.fn(),
+      removeUser: vi.fn(),
+    };
+    const auth = new DesktopAuthController(config, manager as never);
+    await auth.initialize();
+
+    await auth.signIn();
+    expect(auth.snapshot()).toEqual(expect.objectContaining({ loading: false, signInPending: true }));
+    await auth.cancelSignIn();
+    expect(auth.snapshot()).toEqual(expect.objectContaining({ loading: false, signInPending: false }));
+    expect(stateStore.remove).toHaveBeenCalledWith("pending-state");
+    expect(manager.clearStaleState).not.toHaveBeenCalled();
+
+    let releaseTimeoutCleanup!: () => void;
+    const timeoutCleanup = new Promise<string>((resolve) => {
+      releaseTimeoutCleanup = () => resolve("stored-request");
+    });
+    stateStore.remove.mockImplementationOnce(() => timeoutCleanup);
+    await auth.signIn();
+    await vi.advanceTimersByTimeAsync(OIDC_BROWSER_FLOW_TIMEOUT_MS);
+    await vi.waitFor(() => expect(stateStore.remove).toHaveBeenCalledTimes(2));
+    expect(auth.snapshot()).toEqual(expect.objectContaining({
+      loading: false,
+      signInPending: false,
+      error: "AUTH_SIGNIN_TIMEOUT",
+    }));
+    const retry = auth.signIn();
+    await Promise.resolve();
+    expect(manager.signinRedirect).toHaveBeenCalledTimes(2);
+    releaseTimeoutCleanup();
+    await retry;
+    expect(manager.signinRedirect).toHaveBeenCalledTimes(3);
+    expect(auth.snapshot()).toEqual(expect.objectContaining({ loading: false, signInPending: true }));
+    expect(auth.snapshot().error).toBeUndefined();
+    auth.dispose();
+    vi.useRealTimers();
+  });
+
   test("cleans a partial listener registration before retrying initialization", async () => {
     const firstDeepLinkUnlisten = vi.fn();
     const secondDeepLinkUnlisten = vi.fn();
@@ -315,5 +366,41 @@ describe("Rootline desktop authentication boundary", () => {
       epochResetRequired: true,
       epochResetPreservesConsentedOutbox: true,
     }));
+  });
+
+  test("publishes an actionable count when native sync quarantines invalid legacy mutations", async () => {
+    const storedUser = {
+      profile: { sub: "alice", permissions: ["rootline:profiles:sync"] },
+      access_token: "access", expired: false,
+    };
+    const manager = {
+      getUser: vi.fn(async () => storedUser), signinRedirect: vi.fn(),
+      signinRedirectCallback: vi.fn(), clearStaleState: vi.fn(), revokeTokens: vi.fn(), removeUser: vi.fn(),
+    };
+    tauriMocks.invoke.mockResolvedValue({ quarantinedMutations: 2 });
+    const auth = new DesktopAuthController(config, manager as never);
+    await auth.initialize();
+    await auth.sync();
+    expect(auth.snapshot()).toEqual(expect.objectContaining({ quarantinedMutations: 2 }));
+  });
+
+  test("clears quarantine status when hosted deletion also removes local profiles", async () => {
+    const storedUser = {
+      profile: { sub: "alice", permissions: ["rootline:profiles:sync"] },
+      access_token: "access", expired: false,
+    };
+    const manager = {
+      getUser: vi.fn(async () => storedUser), signinRedirect: vi.fn(),
+      signinRedirectCallback: vi.fn(), revokeTokens: vi.fn(), removeUser: vi.fn(),
+    };
+    tauriMocks.invoke.mockImplementation(async (command: string) =>
+      command === "sync_hosted_profiles" ? { quarantinedMutations: 2 } : undefined);
+    const auth = new DesktopAuthController(config, manager as never);
+    await auth.initialize();
+    await auth.sync();
+
+    await auth.deleteAccountData(true);
+
+    expect(auth.snapshot().quarantinedMutations).toBeUndefined();
   });
 });

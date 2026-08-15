@@ -129,6 +129,63 @@ fn rejects_overlapping_roots_and_honors_cancellation() {
 
 #[cfg(unix)]
 #[test]
+fn case_detection_is_read_only_and_overlap_wins_before_target_inspection() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let source = tempdir().unwrap();
+    let target = tempdir().unwrap();
+    fs::create_dir_all(source.path().join("docs/api")).unwrap();
+    fs::create_dir(target.path().join("existing-directory")).unwrap();
+    fs::write(target.path().join("keep.bin"), [0, 1, 2, 255]).unwrap();
+    let before_entries = fs::read_dir(target.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    let before_bytes = fs::read(target.path().join("keep.bin")).unwrap();
+    let original_mode = fs::metadata(target.path()).unwrap().permissions().mode();
+    fs::set_permissions(target.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+    let plan = scan_plan(
+        &request(source.path(), target.path()),
+        &CancellationToken::default(),
+    )
+    .unwrap();
+    assert_eq!(plan.missing, ["docs", "docs/api"]);
+
+    fs::set_permissions(target.path(), fs::Permissions::from_mode(original_mode)).unwrap();
+    let after_entries = fs::read_dir(target.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(after_entries, before_entries);
+    assert_eq!(
+        fs::read(target.path().join("keep.bin")).unwrap(),
+        before_bytes
+    );
+
+    let nested_target = source.path().join("nested-target");
+    fs::create_dir(&nested_target).unwrap();
+    fs::write(nested_target.join("sentinel"), b"unchanged").unwrap();
+    fs::set_permissions(&nested_target, fs::Permissions::from_mode(0o555)).unwrap();
+    let error = scan_plan(
+        &request(source.path(), &nested_target),
+        &CancellationToken::default(),
+    )
+    .unwrap_err();
+    fs::set_permissions(&nested_target, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(error.code, NativeErrorCode::PathOverlap);
+    assert_eq!(
+        fs::read(nested_target.join("sentinel")).unwrap(),
+        b"unchanged"
+    );
+
+    let implementation = include_str!("../src/lib.rs");
+    assert!(!implementation.contains(".rootline-case-probe"));
+    assert!(!implementation.contains("create_new(true)"));
+}
+
+#[cfg(unix)]
+#[test]
 fn skips_symbolic_links_instead_of_following_them() {
     use std::os::unix::fs::symlink;
 
@@ -151,6 +208,21 @@ fn skips_symbolic_links_instead_of_following_them() {
     assert_eq!(
         scan_plan(
             &request(&linked_root, target.path()),
+            &CancellationToken::default(),
+        )
+        .unwrap_err()
+        .code,
+        NativeErrorCode::InvalidPath,
+    );
+
+    let parent = tempdir().unwrap();
+    let real_ancestor = tempdir().unwrap();
+    fs::create_dir(real_ancestor.path().join("source")).unwrap();
+    let linked_ancestor = parent.path().join("linked-ancestor");
+    symlink(real_ancestor.path(), &linked_ancestor).unwrap();
+    assert_eq!(
+        scan_plan(
+            &request(&linked_ancestor.join("source"), target.path()),
             &CancellationToken::default(),
         )
         .unwrap_err()
@@ -231,6 +303,188 @@ fn migrates_and_persists_offline_state_with_bounded_history() {
 }
 
 #[test]
+fn native_profile_limits_are_enforced_before_profile_or_outbox_persistence() {
+    let directory = tempdir().unwrap();
+    let database = Database::open(directory.path().join("profile-limits.sqlite3")).unwrap();
+    let boundary = Profile {
+        id: "boundary".into(),
+        name: "n".repeat(80),
+        source_path: "s".repeat(4096),
+        target_path: "t".repeat(4096),
+        exclusions: (0..100).map(|_| "x".repeat(256)).collect(),
+        created_at: "2026-08-15T00:00:00Z".into(),
+        updated_at: "2026-08-15T00:00:00Z".into(),
+    };
+    database.save_profile(&boundary).unwrap();
+    let before_profiles = database.list_profiles().unwrap();
+    let before_outbox = database.pending_outbox().unwrap();
+
+    let invalid = [
+        Profile {
+            id: "bad-name".into(),
+            name: "n".repeat(81),
+            ..boundary.clone()
+        },
+        Profile {
+            id: "bad-source".into(),
+            source_path: String::new(),
+            ..boundary.clone()
+        },
+        Profile {
+            id: "bad-target".into(),
+            target_path: "t".repeat(4097),
+            ..boundary.clone()
+        },
+        Profile {
+            id: "bad-count".into(),
+            exclusions: (0..101).map(|_| "x".into()).collect(),
+            ..boundary.clone()
+        },
+        Profile {
+            id: "bad-pattern".into(),
+            exclusions: vec!["x".repeat(257)],
+            ..boundary.clone()
+        },
+    ];
+    for profile in invalid {
+        assert_eq!(
+            database.save_profile(&profile).unwrap_err().code,
+            NativeErrorCode::ValidationFailed
+        );
+        assert_eq!(database.list_profiles().unwrap(), before_profiles);
+        assert_eq!(database.pending_outbox().unwrap(), before_outbox);
+    }
+}
+
+#[test]
+fn v5_upgrade_quarantines_invalid_outbox_without_removing_local_profiles_and_recovers_on_save() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("v5-invalid-outbox.sqlite3");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(&format!(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (1);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (2);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (3);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (4);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (5);",
+            include_str!("../migrations/0001_offline_state.sql"),
+            include_str!("../migrations/0002_account_scoped_sync.sql"),
+            include_str!("../migrations/0003_sync_session_generation.sql"),
+            include_str!("../migrations/0004_consented_epoch_adoption.sql"),
+            include_str!("../migrations/0005_sync_lifecycle_generation.sql"),
+        ))
+        .unwrap();
+    let invalid_profile = Profile {
+        id: "legacy-invalid".into(),
+        name: "n".repeat(81),
+        source_path: "/legacy/source".into(),
+        target_path: "/legacy/target".into(),
+        exclusions: vec![],
+        created_at: "2026-08-15T00:00:00Z".into(),
+        updated_at: "2026-08-15T00:00:00Z".into(),
+    };
+    connection
+        .execute(
+            "INSERT INTO profiles(id, name, source_path, target_path, exclusions_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, '[]', ?5, ?6)",
+            rusqlite::params![
+                invalid_profile.id,
+                invalid_profile.name,
+                invalid_profile.source_path,
+                invalid_profile.target_path,
+                invalid_profile.created_at,
+                invalid_profile.updated_at
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO mutation_outbox(mutation_id, kind, payload, occurred_at, profile_id)
+             VALUES (?1, 'upsert', ?2, ?3, ?4)",
+            rusqlite::params![
+                "00000000-0000-4000-8007-000000000001",
+                serde_json::to_string(&invalid_profile).unwrap(),
+                invalid_profile.updated_at,
+                invalid_profile.id
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let database = Database::open(&path).unwrap();
+    assert_eq!(
+        database.list_profiles().unwrap().as_slice(),
+        std::slice::from_ref(&invalid_profile)
+    );
+    assert!(database.pending_outbox().unwrap().is_empty());
+    let quarantined = database.quarantined_mutations().unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].profile_id, invalid_profile.id);
+    assert!(quarantined[0].reason.contains("name"));
+    database.claim_hosted_account("alice", true).unwrap();
+    assert_eq!(
+        database.hosted_sync_request("alice").unwrap()["mutations"],
+        serde_json::json!([])
+    );
+
+    let corrected = Profile {
+        name: "Corrected".into(),
+        updated_at: "2026-08-15T00:01:00Z".into(),
+        ..invalid_profile
+    };
+    database.save_profile(&corrected).unwrap();
+    assert!(database.quarantined_mutations().unwrap().is_empty());
+    assert_eq!(database.list_profiles().unwrap(), [corrected]);
+    assert_eq!(
+        database.hosted_sync_request("alice").unwrap()["mutations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn deleting_a_quarantined_profile_clears_its_actionable_status_and_queues_a_tombstone() {
+    let directory = tempdir().unwrap();
+    let database = Database::open(directory.path().join("quarantine-delete.sqlite3")).unwrap();
+    let profile_id = "legacy-invalid";
+    let invalid = Profile {
+        id: profile_id.into(),
+        name: "n".repeat(81),
+        source_path: "/source".into(),
+        target_path: "/target".into(),
+        exclusions: vec![],
+        created_at: "2026-08-15T00:00:00Z".into(),
+        updated_at: "2026-08-15T00:00:00Z".into(),
+    };
+    database
+        .enqueue_mutation(
+            "00000000-0000-4000-8007-000000000099",
+            "upsert",
+            &serde_json::to_string(&invalid).unwrap(),
+            &invalid.updated_at,
+        )
+        .unwrap();
+    database.hosted_sync_request("alice").unwrap();
+    assert_eq!(database.quarantined_mutations().unwrap().len(), 1);
+
+    database.delete_profile(profile_id).unwrap();
+    assert!(database.quarantined_mutations().unwrap().is_empty());
+    let pending = database.pending_outbox().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].kind, "delete");
+}
+
+#[test]
 fn generates_independent_per_install_vault_passwords() {
     let first = random_vault_password();
     let second = random_vault_password();
@@ -277,9 +531,26 @@ fn clearing_synced_local_data_is_explicit_and_keeps_run_history() {
     database
         .set_sync_cursor("00000000-0000-4000-8000-000000000001", "cursor")
         .unwrap();
+    let invalid_profile = Profile {
+        name: "n".repeat(81),
+        ..profile.clone()
+    };
+    database
+        .enqueue_mutation(
+            "00000000-0000-4000-8007-000000000100",
+            "upsert",
+            &serde_json::to_string(&invalid_profile).unwrap(),
+            &invalid_profile.updated_at,
+        )
+        .unwrap();
+    database.claim_hosted_account("alice", true).unwrap();
+    let _ = database.hosted_sync_request("alice").unwrap();
+    assert_eq!(database.quarantined_mutations().unwrap().len(), 1);
+
     database.clear_local_synced_data().unwrap();
     assert!(database.list_profiles().unwrap().is_empty());
     assert!(database.pending_outbox().unwrap().is_empty());
+    assert!(database.quarantined_mutations().unwrap().is_empty());
     assert_eq!(database.sync_cursor().unwrap(), None);
     assert_eq!(database.run_history().unwrap().len(), 1);
 }
@@ -329,6 +600,51 @@ fn hosted_outbox_contains_only_profiles_and_applies_receipts_transactionally() {
     );
     assert_eq!(database.list_profiles().unwrap()[0].name, "Remote arrival");
     assert_eq!(database.run_history().unwrap()[0].id, "private-run");
+}
+
+#[test]
+fn invalid_hosted_profile_is_rejected_before_profile_or_cursor_persistence() {
+    let directory = tempdir().unwrap();
+    let database = Database::open(directory.path().join("invalid-hosted.sqlite3")).unwrap();
+    let request = database.hosted_sync_request("subject").unwrap();
+    let epoch = request["epoch"].as_str().unwrap();
+    let generation = database
+        .hosted_sync_generation("subject", epoch, "")
+        .unwrap();
+
+    let error = database
+        .apply_hosted_sync_response(
+            "subject",
+            epoch,
+            "",
+            generation,
+            &serde_json::json!({
+                "epoch": epoch,
+                "cursor": "must-not-commit",
+                "records": [{
+                    "kind": "profile",
+                    "revision": 1,
+                    "profile": {
+                        "id": "invalid-hosted-profile",
+                        "name": "n".repeat(81),
+                        "sourcePath": "/source",
+                        "targetPath": "/target",
+                        "exclusions": [],
+                        "createdAt": "2026-08-15T00:00:00Z",
+                        "updatedAt": "2026-08-15T00:00:00Z"
+                    }
+                }],
+                "receipts": []
+            }),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.code, NativeErrorCode::ValidationFailed);
+    assert!(database.list_profiles().unwrap().is_empty());
+    assert_eq!(
+        database.sync_cursor().unwrap(),
+        Some((epoch.into(), String::new()))
+    );
 }
 
 #[test]

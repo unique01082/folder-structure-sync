@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import axe from "axe-core";
 import { describe, expect, test, vi } from "vitest";
@@ -6,7 +6,7 @@ import { describe, expect, test, vi } from "vitest";
 import { App } from "../App";
 import { DiffTree } from "../components/DiffTree";
 import type { NativeGateway, ScanPlan } from "../native";
-import type { AuthController, AuthSnapshot } from "../auth";
+import type { AuthController, AuthSnapshot, ProfileSyncCoordinator } from "../auth";
 
 const plan: ScanPlan = {
   operationId: "scan-1",
@@ -203,6 +203,7 @@ describe("Rootline desktop workflow", () => {
       snapshot: () => state,
       subscribe: (listener) => { listeners.add(listener); listener(state); return () => listeners.delete(listener); },
       initialize: vi.fn(async () => undefined), signIn: vi.fn(async () => undefined),
+      cancelSignIn: vi.fn(async () => undefined),
       handleCallback: vi.fn(async () => undefined), signOut: vi.fn(async () => undefined),
       deleteAccountData: vi.fn(async () => undefined), resolveEpochReset: vi.fn(async () => undefined), resolveAccountClaim: vi.fn(async () => undefined),
       sync: vi.fn(async () => undefined), dispose: vi.fn(),
@@ -214,6 +215,77 @@ describe("Rootline desktop workflow", () => {
     listeners.forEach((listener) => listener(state));
     await waitFor(() => expect(screen.queryByRole("option", { name: "Remote" })).not.toBeInTheDocument());
     expect(screen.queryByText("/private/path")).not.toBeInTheDocument();
+  });
+
+  test("enforces shared profile limits in the UI with localized errors before native persistence", async () => {
+    const user = userEvent.setup();
+    const native = gateway();
+    render(<App gateway={native} initialProfile={{
+      id: "limits", name: "Valid", sourcePath: "/source", targetPath: "/target",
+      exclusions: [], createdAt: "x", updatedAt: "x",
+    }} />);
+    const name = screen.getByRole("textbox", { name: "Profile name" });
+    expect(name).toHaveAttribute("minlength", "1");
+    expect(name).toHaveAttribute("maxlength", "80");
+    expect(name).toBeRequired();
+
+    fireEvent.change(name, { target: { value: "n".repeat(81) } });
+    await user.click(screen.getByRole("button", { name: "Save profile" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Profile name must contain 1–80 characters.");
+    expect(native.saveProfile).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Tiếng Việt" }));
+    await user.click(screen.getByRole("button", { name: "Lưu hồ sơ" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Tên hồ sơ phải có từ 1–80 ký tự.");
+    expect(native.saveProfile).not.toHaveBeenCalled();
+  });
+
+  test("localizes native profile validation failures without persisting UI state", async () => {
+    const user = userEvent.setup();
+    const native = gateway({
+      saveProfile: vi.fn(async () => { throw { code: "VALIDATION_FAILED", message: "raw native limit" }; }),
+    });
+    render(<App gateway={native} initialProfile={{
+      id: "limits", name: "Valid", sourcePath: "/source", targetPath: "/target",
+      exclusions: [], createdAt: "x", updatedAt: "x",
+    }} />);
+    await user.click(screen.getByRole("button", { name: "Tiếng Việt" }));
+    await user.click(screen.getByRole("button", { name: "Lưu hồ sơ" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Hồ sơ vượt quá giới hạn cho phép");
+    expect(screen.queryByText("raw native limit")).not.toBeInTheDocument();
+  });
+
+  test("deletes a profile through a keyboard-accessible localized confirmation and queues sync", async () => {
+    const user = userEvent.setup();
+    const profile = {
+      id: "delete-me", name: "Archive", sourcePath: "/archive", targetPath: "/backup",
+      exclusions: [], createdAt: "x", updatedAt: "x",
+    };
+    const native = gateway({ listProfiles: vi.fn(async () => [profile]) });
+    const coordinator = { profileEdited: vi.fn() } as unknown as ProfileSyncCoordinator;
+    render(<App gateway={native} syncCoordinator={coordinator} />);
+
+    const option = await screen.findByRole("option", { name: "Archive" });
+    await user.click(option);
+    option.focus();
+    await user.keyboard("{Delete}");
+    const englishDialog = screen.getByRole("dialog", { name: "Delete profile Archive?" });
+    expect(englishDialog).toHaveTextContent("Run history is preserved");
+    expect(screen.getByRole("button", { name: "Cancel profile deletion" })).toHaveFocus();
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(option).toHaveFocus());
+
+    await user.click(screen.getByRole("button", { name: "Tiếng Việt" }));
+    await user.click(screen.getByRole("button", { name: "Xóa hồ sơ Archive" }));
+    const vietnameseDialog = screen.getByRole("dialog", { name: "Xóa hồ sơ Archive?" });
+    expect(vietnameseDialog).toHaveTextContent("Lịch sử lượt chạy vẫn được giữ lại");
+    await user.click(screen.getByRole("button", { name: "Xác nhận xóa hồ sơ" }));
+
+    await waitFor(() => expect(native.deleteProfile).toHaveBeenCalledWith("delete-me"));
+    expect(screen.queryByRole("option", { name: "Archive" })).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Tên hồ sơ" })).toHaveValue("");
+    expect(coordinator.profileEdited).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Hồ sơ mới" })).toHaveFocus();
   });
 });
 

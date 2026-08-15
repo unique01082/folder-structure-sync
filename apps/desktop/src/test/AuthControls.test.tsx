@@ -1,5 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import axe from "axe-core";
 import { expect, test, vi } from "vitest";
 
 import { AuthControls } from "../components/AuthControls";
@@ -13,6 +14,7 @@ test("sign-out explicitly keeps or removes local synced profiles without renderi
     subscribe: (listener) => { listener(state); return () => undefined; },
     initialize: vi.fn(async () => undefined),
     signIn: vi.fn(async () => undefined),
+    cancelSignIn: vi.fn(async () => undefined),
     handleCallback: vi.fn(async () => undefined),
     signOut: vi.fn(async () => undefined),
     deleteAccountData: vi.fn(async () => undefined),
@@ -50,6 +52,7 @@ test("requires an explicit keep-or-remove decision after an epoch reset", async 
     snapshot: () => state,
     subscribe: (listener) => { listener(state); return () => undefined; },
     initialize: vi.fn(async () => undefined), signIn: vi.fn(async () => undefined),
+    cancelSignIn: vi.fn(async () => undefined),
     handleCallback: vi.fn(async () => undefined), signOut: vi.fn(async () => undefined),
     deleteAccountData: vi.fn(async () => undefined), resolveEpochReset: vi.fn(async () => undefined), resolveAccountClaim: vi.fn(async () => undefined),
     sync: vi.fn(async () => undefined), dispose: vi.fn(),
@@ -73,6 +76,7 @@ test("explains that accepting an existing epoch keeps explicitly consented devic
     snapshot: () => state,
     subscribe: (listener: (snapshot: AuthSnapshot) => void) => { listener(state); return () => undefined; },
     initialize: vi.fn(async () => undefined), signIn: vi.fn(async () => undefined),
+    cancelSignIn: vi.fn(async () => undefined),
     handleCallback: vi.fn(async () => undefined), signOut: vi.fn(async () => undefined),
     deleteAccountData: vi.fn(async () => undefined), resolveEpochReset: vi.fn(async () => undefined),
     resolveAccountClaim: vi.fn(async () => undefined), sync: vi.fn(async () => undefined), dispose: vi.fn(),
@@ -93,6 +97,7 @@ test("requires explicit consent before existing absolute-path profiles are claim
     snapshot: () => state,
     subscribe: (listener: (snapshot: AuthSnapshot) => void) => { listener(state); return () => undefined; },
     initialize: vi.fn(async () => undefined), signIn: vi.fn(async () => undefined),
+    cancelSignIn: vi.fn(async () => undefined),
     handleCallback: vi.fn(async () => undefined), signOut: vi.fn(async () => undefined),
     deleteAccountData: vi.fn(async () => undefined), resolveEpochReset: vi.fn(async () => undefined),
     resolveAccountClaim: vi.fn(async () => undefined), sync: vi.fn(async () => undefined), dispose: vi.fn(),
@@ -103,4 +108,68 @@ test("requires explicit consent before existing absolute-path profiles are claim
   expect(screen.getByRole("dialog", { name: "Local profile upload options" })).toHaveTextContent(/absolute paths/i);
   await user.click(screen.getByRole("button", { name: "Keep local only" }));
   expect(auth.resolveAccountClaim).toHaveBeenCalledWith(false);
+});
+
+test("fully localizes controls and provides a trapped, Escape-restoring Vietnamese dialog", async () => {
+  const user = userEvent.setup();
+  const state: AuthSnapshot = {
+    configured: true, loading: false, dataVersion: 0,
+    user: { sub: "alice", name: "Alice", permissions: ["rootline:profiles:sync"] },
+  };
+  const auth = {
+    snapshot: () => state,
+    subscribe: (listener: (snapshot: AuthSnapshot) => void) => { listener(state); return () => undefined; },
+    initialize: vi.fn(async () => undefined), signIn: vi.fn(async () => undefined),
+    cancelSignIn: vi.fn(async () => undefined), handleCallback: vi.fn(async () => undefined),
+    signOut: vi.fn(async () => undefined), deleteAccountData: vi.fn(async () => undefined),
+    resolveEpochReset: vi.fn(async () => undefined), resolveAccountClaim: vi.fn(async () => undefined),
+    sync: vi.fn(async () => undefined), dispose: vi.fn(),
+  } satisfies AuthController;
+  const view = render(<AuthControls auth={auth} locale="vi" />);
+
+  const trigger = screen.getByRole("button", { name: "Đăng xuất" });
+  expect(screen.getByRole("button", { name: "Đồng bộ ngay" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Xóa dữ liệu lưu trữ" })).toBeInTheDocument();
+  expect(screen.queryByText("Sync now")).not.toBeInTheDocument();
+  await user.click(trigger);
+  const dialog = screen.getByRole("dialog", { name: "Tùy chọn đăng xuất" });
+  expect(dialog).toHaveTextContent(/lịch sử lượt chạy vẫn được giữ lại/i);
+  const cancel = screen.getByRole("button", { name: "Hủy" });
+  expect(cancel).toHaveFocus();
+  await user.keyboard("{Shift>}{Tab}{/Shift}");
+  expect(screen.getByRole("button", { name: "Xóa hồ sơ cục bộ" })).toHaveFocus();
+  await user.keyboard("{Escape}");
+  expect(dialog).not.toBeInTheDocument();
+  expect(trigger).toHaveFocus();
+  expect((await axe.run(view.container)).violations).toEqual([]);
+});
+
+test("offers cancel and retry for a pending browser sign-in and explains quarantined changes", async () => {
+  const user = userEvent.setup();
+  const pending: AuthSnapshot = { configured: true, loading: false, signInPending: true, user: null, dataVersion: 0 };
+  const auth = {
+    snapshot: () => pending,
+    subscribe: (listener: (snapshot: AuthSnapshot) => void) => { listener(pending); return () => undefined; },
+    initialize: vi.fn(async () => undefined), signIn: vi.fn(async () => undefined),
+    cancelSignIn: vi.fn(async () => undefined), handleCallback: vi.fn(async () => undefined),
+    signOut: vi.fn(async () => undefined), deleteAccountData: vi.fn(async () => undefined),
+    resolveEpochReset: vi.fn(async () => undefined), resolveAccountClaim: vi.fn(async () => undefined),
+    sync: vi.fn(async () => undefined), dispose: vi.fn(),
+  } satisfies AuthController;
+  const view = render(<AuthControls auth={auth} locale="en" />);
+  expect(screen.getByRole("status")).toHaveTextContent("Waiting for sign-in in your browser");
+  await user.click(screen.getByRole("button", { name: "Cancel sign-in" }));
+  await user.click(screen.getByRole("button", { name: "Try sign-in again" }));
+  expect(auth.cancelSignIn).toHaveBeenCalledTimes(1);
+  expect(auth.signIn).toHaveBeenCalledTimes(1);
+
+  const synced = { ...pending, signInPending: false, user: { sub: "alice", permissions: [] }, quarantinedMutations: 2 } satisfies AuthSnapshot;
+  view.rerender(<AuthControls auth={{
+    ...auth,
+    snapshot: () => synced,
+    subscribe: (listener) => { listener(synced); return () => undefined; },
+  }} locale="en" />);
+  expect(screen.getByRole("status")).toHaveTextContent("2 local profile changes could not be uploaded");
+  expect(screen.getByRole("status")).toHaveTextContent("Edit and save the affected profiles");
+  expect(screen.getByRole("status")).toHaveTextContent("delete");
 });

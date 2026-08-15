@@ -66,7 +66,7 @@ export class SyncService {
       const receipts: Array<{ mutationId: string; revision: number }> = [];
       for (const mutation of dto.mutations) {
         const hash = mutationHash(mutation);
-        const prior = await tx.mutationReceipt.findUnique({ where: { subject_mutationId: { subject, mutationId: mutation.mutationId } } });
+        const prior = await tx.mutationDedup.findUnique({ where: { subject_mutationId: { subject, mutationId: mutation.mutationId } } });
         if (prior) {
           if (prior.mutationHash !== hash) throw new ConflictException("A mutation ID cannot be reused for different profile data.");
           receipts.push({ mutationId: mutation.mutationId, revision: Number(prior.revision) });
@@ -91,6 +91,9 @@ export class SyncService {
           },
         });
         await tx.syncChange.create({ data: { subject, revision, record: json(record), committedAt } });
+        await tx.mutationDedup.create({
+          data: { subject, mutationId: mutation.mutationId, mutationHash: hash, revision, createdAt: committedAt },
+        });
         await tx.mutationReceipt.create({
           data: { subject, mutationId: mutation.mutationId, mutationHash: hash, revision, expiresAt: new Date(committedAt.getTime() + RECEIPT_TTL_MS) },
         });
@@ -131,6 +134,7 @@ export class SyncService {
       await tx.profileRecord.deleteMany({ where: { subject } });
       await tx.syncChange.deleteMany({ where: { subject } });
       await tx.mutationReceipt.deleteMany({ where: { subject } });
+      await tx.mutationDedup.deleteMany({ where: { subject } });
       await tx.userSyncState.update({ where: { subject }, data: { epoch, revision: 0n } });
       return { epoch };
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });

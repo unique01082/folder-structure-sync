@@ -17,6 +17,7 @@ model UserSyncState {
   profiles ProfileRecord[]
   changes  SyncChange[]
   receipts MutationReceipt[]
+  dedupEntries MutationDedup[]
 
   @@map("user_sync_state")
 }
@@ -62,4 +63,17 @@ model MutationReceipt {
   @@id([subject, mutationId])
   @@index([expiresAt])
   @@map("mutation_receipt")
+}
+
+model MutationDedup {
+  subject      String
+  mutationId   String   @db.Uuid @map("mutation_id")
+  mutationHash String   @map("mutation_hash")
+  revision     BigInt
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  owner UserSyncState @relation(fields: [subject], references: [subject], onDelete: Cascade)
+
+  @@id([subject, mutationId])
+  @@map("mutation_dedup")
 }

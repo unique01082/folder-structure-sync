@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import request from "supertest";
 import { Logger } from "@nestjs/common";
+import { PrismaClient } from "@prisma/client";
 import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 
 import { createTestApplication, type TestApplication } from "../src/testing.js";
@@ -22,6 +23,7 @@ describe("Rootline hosted sync (real PostgreSQL)", () => {
   let directory: string;
   let privateKey: CryptoKey;
   let apiUrl: string;
+  let postgres: PrismaClient;
 
   beforeAll(async () => {
     if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL must point to a real PostgreSQL test database");
@@ -43,10 +45,15 @@ describe("Rootline hosted sync (real PostgreSQL)", () => {
     const address = fixture.server.address();
     if (!address || typeof address === "string") throw new Error("Test API did not bind a TCP port");
     apiUrl = `http://127.0.0.1:${address.port}`;
+    postgres = new PrismaClient({
+      datasources: { db: { url: process.env.DATABASE_URL } },
+    });
+    await postgres.$connect();
     await fixture.resetDatabase();
   });
 
   afterAll(async () => {
+    await postgres?.$disconnect();
     await fixture?.close();
     if (directory) await rm(directory, { recursive: true, force: true });
   });
@@ -121,6 +128,61 @@ describe("Rootline hosted sync (real PostgreSQL)", () => {
     const isolated = await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${bob}`)
       .send({ deviceId: "bob-1", epoch: EPOCH, mutations: [] }).expect(200);
     expect(isolated.body.records).toEqual([]);
+  });
+
+  test("keeps mutation idempotency for the account epoch after the 90-day receipt expires", async () => {
+    const subject = "durable-dedup-user";
+    const auth = await token(subject);
+    const original = mutation(PROFILE_ID, "Original", "00000000-0000-4000-8000-000000000211");
+    const newer = mutation(PROFILE_ID, "Newer", "00000000-0000-4000-8000-000000000212");
+
+    const revisionOne = await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${auth}`)
+      .send({ deviceId: "dedup-a", epoch: EPOCH, mutations: [original] }).expect(200);
+    const revisionTwo = await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${auth}`)
+      .send({ deviceId: "dedup-b", epoch: EPOCH, cursor: revisionOne.body.cursor, mutations: [newer] }).expect(200);
+
+    await postgres.$executeRaw`
+      UPDATE "mutation_receipt"
+      SET "expires_at" = NOW() - INTERVAL '1 day'
+      WHERE "subject" = ${subject} AND "mutation_id" = ${original.mutationId}::uuid
+    `;
+    const replay = await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${auth}`)
+      .send({ deviceId: "dedup-a", epoch: EPOCH, cursor: revisionTwo.body.cursor, mutations: [original] }).expect(200);
+
+    expect(replay.body.receipts).toEqual([{ mutationId: original.mutationId, revision: 1 }]);
+    expect(replay.body.records).toEqual([]);
+    const state = await postgres.$queryRaw<Array<{ revision: bigint }>>`
+      SELECT "revision" FROM "user_sync_state" WHERE "subject" = ${subject}
+    `;
+    const profile = await postgres.$queryRaw<Array<{ profile: { name: string } }>>`
+      SELECT "profile" FROM "profile_record" WHERE "subject" = ${subject} AND "profile_id" = ${PROFILE_ID}
+    `;
+    const changes = await postgres.$queryRaw<Array<{ count: bigint }>>`
+      SELECT COUNT(*)::bigint AS "count" FROM "sync_change" WHERE "subject" = ${subject}
+    `;
+    const receipts = await postgres.$queryRaw<Array<{ count: bigint }>>`
+      SELECT COUNT(*)::bigint AS "count" FROM "mutation_receipt"
+      WHERE "subject" = ${subject} AND "mutation_id" = ${original.mutationId}::uuid
+    `;
+    expect(state[0]?.revision).toBe(2n);
+    expect(profile[0]?.profile.name).toBe("Newer");
+    expect(changes[0]?.count).toBe(2n);
+    expect(receipts[0]?.count).toBe(0n);
+
+    await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${auth}`)
+      .send({
+        deviceId: "dedup-a",
+        epoch: EPOCH,
+        cursor: revisionTwo.body.cursor,
+        mutations: [{ ...original, profile: { ...original.profile, name: "Collision" } }],
+      }).expect(409);
+
+    await request(fixture.server).delete("/v1/account-data").set("Authorization", `Bearer ${auth}`)
+      .send({ epoch: EPOCH }).expect(200);
+    const ledger = await postgres.$queryRaw<Array<{ count: bigint }>>`
+      SELECT COUNT(*)::bigint AS "count" FROM "mutation_dedup" WHERE "subject" = ${subject}
+    `;
+    expect(ledger[0]?.count).toBe(0n);
   });
 
   test("returns cursor deltas and tombstones without resurrecting profiles", async () => {
@@ -211,6 +273,34 @@ describe("Rootline hosted sync (real PostgreSQL)", () => {
     expect(pageTwo.body.hasMore).toBe(false);
     await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${auth}`)
       .send({ deviceId: "offline-reader", epoch: EPOCH, cursor: "not-a-cursor", mutations: [] }).expect(400);
+  });
+
+  test("enforces the shared profile limits at their exact boundaries", async () => {
+    const auth = await token("profile-limit-user");
+    const boundary = mutation(PROFILE_ID, "n".repeat(80), "00000000-0000-4000-8000-000000000521");
+    boundary.profile.sourcePath = "s".repeat(4096);
+    boundary.profile.targetPath = "t".repeat(4096);
+    boundary.profile.exclusions = Array.from({ length: 100 }, () => "x".repeat(256));
+    await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${auth}`)
+      .send({ deviceId: "profile-limits", epoch: EPOCH, mutations: [boundary] }).expect(200);
+
+    const invalidProfiles = [
+      { ...boundary.profile, name: "n".repeat(81) },
+      { ...boundary.profile, sourcePath: "" },
+      { ...boundary.profile, targetPath: "t".repeat(4097) },
+      { ...boundary.profile, exclusions: Array.from({ length: 101 }, () => "x") },
+      { ...boundary.profile, exclusions: [""] },
+      { ...boundary.profile, exclusions: ["x".repeat(257)] },
+    ];
+    for (const [index, profile] of invalidProfiles.entries()) {
+      const invalid = {
+        ...boundary,
+        mutationId: `00000000-0000-4000-8000-${String(522 + index).padStart(12, "0")}`,
+        profile,
+      };
+      await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${auth}`)
+        .send({ deviceId: "profile-limits", epoch: EPOCH, mutations: [invalid] }).expect(400);
+    }
   });
 
   test("enforces DTO, body, and per-user request limits", async () => {
