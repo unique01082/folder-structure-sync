@@ -1,0 +1,231 @@
+name: Release Rootline API 2.0.0
+
+"on":
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type release-api-v2.0.0 to deploy the stable API
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-api-2.0.0
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    environment: api-production
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm audit --prod --audit-level high
+      - name: Require exact version and every production deployment secret
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+          ROOTLINE_API_DATABASE_URL: ${{ secrets.ROOTLINE_API_DATABASE_URL }}
+          ROOTLINE_API_DEPLOY_WEBHOOK_URL: ${{ secrets.ROOTLINE_API_DEPLOY_WEBHOOK_URL }}
+          ROOTLINE_API_DEPLOY_TOKEN: ${{ secrets.ROOTLINE_API_DEPLOY_TOKEN }}
+          ROOTLINE_API_BASE_URL: ${{ secrets.ROOTLINE_API_BASE_URL }}
+          ROOTLINE_JWT_ISSUER: ${{ secrets.ROOTLINE_JWT_ISSUER }}
+          ROOTLINE_JWT_AUDIENCE: ${{ secrets.ROOTLINE_JWT_AUDIENCE }}
+          ROOTLINE_JWT_JWKS_B64: ${{ secrets.ROOTLINE_JWT_JWKS_B64 }}
+        run: |
+          set -eu
+          if [ "${GITHUB_REF}" != "refs/tags/v2.0.0" ]; then
+            echo "::error::Stable API release is restricted to the existing tag refs/tags/v2.0.0."
+            exit 1
+          fi
+          if [ "${CONFIRMATION}" != "release-api-v2.0.0" ]; then
+            echo "::error::Stable API release blocked. Re-run with confirmation=release-api-v2.0.0."
+            exit 1
+          fi
+          missing=""
+          for name in ROOTLINE_API_DATABASE_URL ROOTLINE_API_DEPLOY_WEBHOOK_URL ROOTLINE_API_DEPLOY_TOKEN ROOTLINE_API_BASE_URL ROOTLINE_JWT_ISSUER ROOTLINE_JWT_AUDIENCE ROOTLINE_JWT_JWKS_B64; do
+            eval "value=\${$name:-}"
+            [ -n "$value" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Stable API release blocked. Configure repository environment secrets:$missing"
+            exit 1
+          fi
+          case "${ROOTLINE_API_BASE_URL}" in https://*) ;; *) echo "::error::ROOTLINE_API_BASE_URL must use HTTPS."; exit 1 ;; esac
+          case "${ROOTLINE_API_DEPLOY_WEBHOOK_URL}" in https://*) ;; *) echo "::error::ROOTLINE_API_DEPLOY_WEBHOOK_URL must use HTTPS."; exit 1 ;; esac
+          node <<'NODE'
+          const database = new URL(process.env.ROOTLINE_API_DATABASE_URL);
+          if (!["postgres:", "postgresql:"].includes(database.protocol)) throw new Error("ROOTLINE_API_DATABASE_URL must be PostgreSQL.");
+          if (database.searchParams.get("sslmode") !== "require" || database.searchParams.get("sslaccept") !== "strict") {
+            throw new Error("ROOTLINE_API_DATABASE_URL must verify PostgreSQL TLS with sslmode=require&sslaccept=strict.");
+          }
+          if (new URL(process.env.ROOTLINE_JWT_ISSUER).protocol !== "https:") throw new Error("ROOTLINE_JWT_ISSUER must use HTTPS.");
+          const jwks = JSON.parse(Buffer.from(process.env.ROOTLINE_JWT_JWKS_B64, "base64").toString("utf8"));
+          if (!Array.isArray(jwks.keys) || !jwks.keys.some((key) => key?.kty === "RSA")) {
+            throw new Error("ROOTLINE_JWT_JWKS_B64 must decode to a JWKS with an RSA public key.");
+          }
+          NODE
+          node -e "const p=require('./apps/api/package.json'); if(p.version !== '2.0.0') throw new Error('apps/api/package.json must be version 2.0.0')"
+
+  image:
+    needs: preflight
+    runs-on: ubuntu-24.04
+    environment: api-production
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.immutable.outputs.image }}
+      build_id: ${{ steps.identity.outputs.build_id }}
+      stable_image: ${{ steps.image.outputs.stable_image }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:api-image
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: identity
+        run: echo "build_id=rootline-2.0.0-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+      - id: image
+        run: |
+          repository="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/rootline-api"
+          echo "image=${repository}:candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          echo "stable_image=${repository}:2.0.0" >> "$GITHUB_OUTPUT"
+      - name: Refuse to overwrite stable image tag
+        env:
+          IMAGE: ${{ steps.image.outputs.stable_image }}
+        run: |
+          set +e
+          inspection=$(docker buildx imagetools inspect "$IMAGE" 2>&1)
+          inspection_status=$?
+          set -e
+          if [ "$inspection_status" -eq 0 ]; then
+            echo "::error::Stable API image ${IMAGE} already exists. Published 2.0.0 bytes are immutable; release a new version."
+            exit 1
+          fi
+          case "$inspection" in
+            *"not found"*|*"manifest unknown"*) ;;
+            *) echo "::error::Could not prove stable API tag ${IMAGE} is unused; refusing to push."; printf '%s\n' "$inspection"; exit 1 ;;
+          esac
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: true
+          tags: ${{ steps.image.outputs.image }}
+          build-args: ROOTLINE_BUILD_ID=${{ steps.identity.outputs.build_id }}
+      - id: immutable
+        name: Resolve immutable image reference
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          repository=${IMAGE%:*}
+          echo "image=${repository}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+  migrate:
+    needs: [preflight, image]
+    runs-on: ubuntu-24.04
+    environment: api-production
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Apply checked-in production migrations
+        env:
+          DATABASE_URL: ${{ secrets.ROOTLINE_API_DATABASE_URL }}
+        run: pnpm --filter @rootline/api exec prisma migrate deploy
+
+  deploy:
+    needs: [preflight, image, migrate]
+    runs-on: ubuntu-24.04
+    environment: api-production
+    steps:
+      - name: Request deployment of the immutable image
+        env:
+          IMAGE: ${{ needs.image.outputs.image }}
+          ROOTLINE_BUILD_ID: ${{ needs.image.outputs.build_id }}
+          DEPLOY_URL: ${{ secrets.ROOTLINE_API_DEPLOY_WEBHOOK_URL }}
+          DEPLOY_TOKEN: ${{ secrets.ROOTLINE_API_DEPLOY_TOKEN }}
+        run: |
+          curl --fail-with-body --silent --show-error --retry 3 -X POST \
+            -H "Authorization: Bearer ${DEPLOY_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "{\"image\":\"${IMAGE}\",\"buildId\":\"${ROOTLINE_BUILD_ID}\"}" \
+            "${DEPLOY_URL}"
+
+  health:
+    needs: [preflight, image, deploy]
+    runs-on: ubuntu-24.04
+    environment: api-production
+    steps:
+      - name: Require deployed API health
+        env:
+          ROOTLINE_API_BASE_URL: ${{ secrets.ROOTLINE_API_BASE_URL }}
+          EXPECTED_BUILD_ID: ${{ needs.image.outputs.build_id }}
+        run: |
+          set -eu
+          for attempt in $(seq 1 30); do
+            echo "Health check attempt ${attempt}/30"
+            body=$(curl --fail --silent --show-error --max-time 10 "${ROOTLINE_API_BASE_URL%/}/healthz" || true)
+            printf '%s' "$body" | jq -e '.status == "ok" and .buildId == env.EXPECTED_BUILD_ID' >/dev/null && exit 0
+            sleep 10
+          done
+          echo "::error::Stable API release blocked: /healthz did not report the requested build identity ${EXPECTED_BUILD_ID}."
+          exit 1
+
+  promote:
+    needs: [image, health]
+    runs-on: ubuntu-24.04
+    environment: api-production
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Recheck stable tag before promotion
+        env:
+          STABLE_IMAGE: ${{ needs.image.outputs.stable_image }}
+        run: |
+          set +e
+          inspection=$(docker buildx imagetools inspect "$STABLE_IMAGE" 2>&1)
+          inspection_status=$?
+          set -e
+          if [ "$inspection_status" -eq 0 ]; then
+            echo "::error::Stable API image ${STABLE_IMAGE} already exists. Refusing to overwrite it."
+            exit 1
+          fi
+          case "$inspection" in
+            *"not found"*|*"manifest unknown"*) ;;
+            *) echo "::error::Could not prove stable API tag ${STABLE_IMAGE} is unused; refusing promotion."; printf '%s\n' "$inspection"; exit 1 ;;
+          esac
+      - name: Promote the verified digest to the stable tag
+        env:
+          SOURCE_IMAGE: ${{ needs.image.outputs.image }}
+          STABLE_IMAGE: ${{ needs.image.outputs.stable_image }}
+        run: docker buildx imagetools create --tag "$STABLE_IMAGE" "$SOURCE_IMAGE"

@@ -1,0 +1,80 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model UserSyncState {
+  subject   String   @id
+  epoch     String   @db.Uuid
+  revision  BigInt   @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  profiles ProfileRecord[]
+  changes  SyncChange[]
+  receipts MutationReceipt[]
+  dedupEntries MutationDedup[]
+
+  @@map("user_sync_state")
+}
+
+model ProfileRecord {
+  subject     String
+  profileId   String   @map("profile_id")
+  kind        String
+  profile     Json?
+  deletedAt   DateTime? @map("deleted_at")
+  revision    BigInt
+  lastDeviceId String   @map("last_device_id")
+  committedAt DateTime @default(now()) @map("committed_at")
+
+  owner UserSyncState @relation(fields: [subject], references: [subject], onDelete: Cascade)
+
+  @@id([subject, profileId])
+  @@index([subject, revision])
+  @@map("profile_record")
+}
+
+model SyncChange {
+  subject     String
+  revision    BigInt
+  record      Json
+  committedAt DateTime @default(now()) @map("committed_at")
+
+  owner UserSyncState @relation(fields: [subject], references: [subject], onDelete: Cascade)
+
+  @@id([subject, revision])
+  @@map("sync_change")
+}
+
+model MutationReceipt {
+  subject    String
+  mutationId String   @db.Uuid @map("mutation_id")
+  mutationHash String @map("mutation_hash")
+  revision   BigInt
+  createdAt  DateTime @default(now()) @map("created_at")
+  expiresAt  DateTime @map("expires_at")
+
+  owner UserSyncState @relation(fields: [subject], references: [subject], onDelete: Cascade)
+
+  @@id([subject, mutationId])
+  @@index([expiresAt])
+  @@map("mutation_receipt")
+}
+
+model MutationDedup {
+  subject      String
+  mutationId   String   @db.Uuid @map("mutation_id")
+  mutationHash String   @map("mutation_hash")
+  revision     BigInt
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  owner UserSyncState @relation(fields: [subject], references: [subject], onDelete: Cascade)
+
+  @@id([subject, mutationId])
+  @@map("mutation_dedup")
+}

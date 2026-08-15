@@ -1,0 +1,9 @@
+.git
+.github
+.superpowers
+.worktrees
+**/dist
+**/node_modules
+apps/desktop/src-tauri/target
+docs
+tests

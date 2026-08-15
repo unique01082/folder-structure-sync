@@ -1,0 +1,47 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Rootline by baole.space",
+  "version": "2.0.0",
+  "identifier": "space.baole.rootline",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "pnpm --dir ../.. build:workspace-deps && pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Rootline by baole.space",
+        "width": 1240,
+        "height": 800,
+        "minWidth": 880,
+        "minHeight": 620,
+        "resizable": true
+      }
+    ],
+    "security": { "csp": null }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": "all",
+    "icon": [],
+    "category": "Utility",
+    "shortDescription": "Safe, additive folder-structure synchronization"
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["rootline"]
+      }
+    },
+    "updater": {
+      "endpoints": [
+        "https://github.com/unique01082/folder-structure-sync/releases/latest/download/latest.json"
+      ],
+      "pubkey": ""
+    }
+  }
+}

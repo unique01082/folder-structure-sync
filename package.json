@@ -1,70 +1,39 @@
 {
-  "name": "folder-structure-sync",
-  "version": "1.0.0",
-  "description": "🚀 Interactive CLI tool for syncing folder structures with smart selection, dependency handling, and beautiful output",
-  "main": "index.js",
-  "bin": {
-    "folder-sync": "index.js"
-  },
-  "scripts": {
-    "start": "node index.js",
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "demo": "node index.js --help",
-    "precheck": "node scripts/pre-publish-check.js",
-    "test-package": "node scripts/test-package.js",
-    "release:patch": "node scripts/release.js patch",
-    "release:minor": "node scripts/release.js minor",
-    "release:major": "node scripts/release.js major",
-    "publish:check": "npm run precheck && npm run test-package",
-    "publish:safe": "npm run publish:check && npm publish",
-    "workflow:stats": "node scripts/workflow.js stats",
-    "workflow:social": "node scripts/workflow.js social",
-    "workflow:promotion": "node scripts/workflow.js promotion",
-    "workflow:commands": "node scripts/workflow.js commands"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/unique01082/folder-structure-sync.git"
-  },
-  "keywords": [
-    "folder",
-    "sync",
-    "directory",
-    "structure",
-    "cli",
-    "interactive",
-    "template",
-    "project-setup",
-    "development",
-    "automation",
-    "filesystem",
-    "folders",
-    "organize"
-  ],
-  "author": {
-    "name": "Bao LE",
-    "email": "bao.lq.it@gmail.com",
-    "url": "https://github.com/unique01082"
-  },
+  "name": "rootline-workspace",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Rootline by baole.space workspace orchestration",
   "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/unique01082/folder-structure-sync/issues"
-  },
-  "homepage": "https://github.com/unique01082/folder-structure-sync#readme",
   "engines": {
-    "node": ">=12.0.0"
+    "node": ">=20.0.0"
   },
-  "files": [
-    "index.js",
-    "sync-config.json",
-    "README.md",
-    "LICENSE",
-    "CHANGELOG.md"
-  ],
-  "dependencies": {
-    "chalk": "^4.1.2",
-    "cli-progress": "^3.12.0",
-    "commander": "^14.0.0",
-    "inquirer": "^8.2.6"
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "audit:prod": "pnpm audit --prod --audit-level high",
+    "build:workspace-deps": "pnpm --filter @rootline/contracts build && pnpm --filter @rootline/core build",
+    "build": "pnpm -r --if-present run build",
+    "lint": "eslint \"apps/**/*.{ts,tsx}\" \"packages/**/*.ts\" \"scripts/**/*.mjs\" \"tests/**/*.mjs\" --max-warnings 0",
+    "test": "pnpm build:workspace-deps && pnpm -r --if-present run test",
+    "test:api-image": "sh apps/api/scripts/test-docker-image.sh",
+    "test:plan": "node --test tests/plan-acceptance.test.mjs",
+    "test:unit": "pnpm build:workspace-deps && pnpm --filter @rootline/contracts test && pnpm --filter @rootline/core test && pnpm --filter folder-structure-sync test:unit && pnpm --filter @rootline/desktop test",
+    "test:release": "node --test tests/*.test.mjs",
+    "validate:workflows": "node --test tests/release-workflows.test.mjs",
+    "typecheck": "pnpm build:workspace-deps && pnpm --filter @rootline/api prisma:generate && pnpm -r --if-present run typecheck"
+  },
+  "pnpm": {
+    "overrides": {
+      "js-yaml@>=5.0.0 <=5.2.1": "5.2.2"
+    }
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/node": "^24.0.0",
+    "eslint": "^9.39.1",
+    "globals": "^16.5.0",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.46.1",
+    "vitest": "^3.2.4",
+    "yaml": "^2.8.1"
   }
 }

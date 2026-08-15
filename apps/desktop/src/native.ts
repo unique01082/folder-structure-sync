@@ -1,0 +1,93 @@
+import { invoke } from "@tauri-apps/api/core";
+
+export interface Profile {
+  id: string;
+  name: string;
+  sourcePath: string;
+  targetPath: string;
+  exclusions: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ScanRequest {
+  operationId: string;
+  sourcePath: string;
+  targetPath: string;
+  exclusions: string[];
+}
+
+export interface ScanPlan {
+  operationId: string;
+  sourceRoot: string;
+  targetRoot: string;
+  sourceFingerprint: string;
+  targetFingerprint: string;
+  targetCaseSensitive: boolean;
+  planFingerprint: string;
+  missing: string[];
+  diffEntries: DiffEntry[];
+  skippedLinks: string[];
+}
+
+export type DiffStatus = "missing" | "exists" | "excluded" | "unreadable";
+
+export interface DiffEntry {
+  relativePath: string;
+  status: DiffStatus;
+}
+
+export type DirectoryStatus = "created" | "already-exists" | "failed";
+
+export interface ApplyResult {
+  runId: string;
+  startedAt: string;
+  finishedAt: string;
+  cancelled: boolean;
+  directories: Array<{ relativePath: string; status: DirectoryStatus; error?: string }>;
+}
+
+export interface ProfileRootAvailability {
+  sourceAvailable: boolean;
+  targetAvailable: boolean;
+}
+
+export interface NativeGateway {
+  chooseFolder(input: { role: "source" | "target" }): Promise<string | null>;
+  inspectProfileRoots(input: { sourcePath: string; targetPath: string }): Promise<ProfileRootAvailability>;
+  scan(request: ScanRequest): Promise<ScanPlan>;
+  apply(input: { request: ScanRequest; plan: ScanPlan; selected: string[]; profileId?: string }): Promise<ApplyResult>;
+  cancel(operationId: string): Promise<void>;
+  listProfiles(): Promise<Profile[]>;
+  saveProfile(profile: Profile): Promise<Profile>;
+  deleteProfile(id: string): Promise<void>;
+}
+
+export const tauriGateway: NativeGateway = {
+  chooseFolder: ({ role }) => invoke<string | null>("choose_folder", { role }),
+  inspectProfileRoots: (input) => invoke<ProfileRootAvailability>("inspect_saved_profile_roots", input),
+  scan: (request) => invoke<ScanPlan>("scan_directories", { request }),
+  apply: (command) => invoke<ApplyResult>("apply_directories", { command }),
+  cancel: (operationId) => invoke<void>("cancel_operation", { operationId }),
+  listProfiles: () => invoke<Profile[]>("list_profiles"),
+  saveProfile: (profile) => invoke<Profile>("save_profile", { profile }),
+  deleteProfile: (id) => invoke<void>("delete_profile", { id }),
+};
+
+export interface NativeFailure {
+  code: string;
+  message: string;
+  details?: Record<string, unknown>;
+}
+
+export function nativeFailure(error: unknown): NativeFailure {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const value = error as Partial<NativeFailure>;
+    return {
+      code: typeof value.code === "string" ? value.code : "INTERNAL",
+      message: typeof value.message === "string" ? value.message : "Unexpected native error.",
+      ...(value.details ? { details: value.details } : {}),
+    };
+  }
+  return { code: "INTERNAL", message: error instanceof Error ? error.message : "Unexpected native error." };
+}

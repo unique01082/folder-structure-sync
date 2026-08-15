@@ -1,0 +1,21 @@
+{
+  "name": "@rootline/contracts",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Internal exported domain and cloud contracts for Rootline by baole.space",
+  "license": "ISC",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run && pnpm run test:types",
+    "test:types": "tsc -p tsconfig.test.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}

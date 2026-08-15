@@ -1,0 +1,30 @@
+{
+  "name": "folder-structure-sync",
+  "version": "2.0.0",
+  "description": "Rootline by baole.space command-line interface",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/unique01082/folder-structure-sync.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "type": "module",
+  "bin": {
+    "folder-sync": "./dist/index.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js --sourcemap",
+    "test": "vitest run",
+    "test:unit": "vitest run --exclude test/package-smoke.test.ts",
+    "test:pack": "vitest run test/package-smoke.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@rootline/contracts": "workspace:*",
+    "@rootline/core": "workspace:*",
+    "esbuild": "^0.28.2"
+  }
+}

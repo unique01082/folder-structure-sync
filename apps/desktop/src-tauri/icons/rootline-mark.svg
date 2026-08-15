@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title description">
+  <title id="title">Rootline</title>
+  <desc id="description">A cyan root line branches into a quiet folder tree on graphite.</desc>
+  <rect width="1024" height="1024" rx="224" fill="#171c1f"/>
+  <path d="M330 226h226c82 0 148 66 148 148v46" fill="none" stroke="#ecf1ef" stroke-width="68" stroke-linecap="round"/>
+  <path d="M320 226v572" fill="none" stroke="#23bac7" stroke-width="68" stroke-linecap="round"/>
+  <path d="M320 506h384M320 798h226" fill="none" stroke="#23bac7" stroke-width="68" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="704" cy="506" r="58" fill="#587b64" stroke="#171c1f" stroke-width="24"/>
+  <circle cx="546" cy="798" r="58" fill="#d69b3b" stroke="#171c1f" stroke-width="24"/>
+</svg>

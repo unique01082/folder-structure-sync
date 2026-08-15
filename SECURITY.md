@@ -1,44 +1,37 @@
-# Security Policy
+# Rootline security policy
 
-## Supported Versions
+## Supported versions
 
-We support the latest version of folder-structure-sync. Please ensure you're using the most recent version before reporting security issues.
+| Version | Status |
+|---|---|
+| `2.0.x` | Supported after the stable `2.0.0` release |
+| `1.1.x` | Security fixes only during the v2 migration window |
+| Earlier | Unsupported |
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 1.x.x   | :white_check_mark: |
+## Report a vulnerability
 
-## Reporting a Vulnerability
+Use a private GitHub security advisory for `unique01082/folder-structure-sync`. Do not include tokens, absolute filesystem paths, database credentials, signing keys, or personal data in a public issue. Include affected version/platform, impact, reproduction steps, and any known mitigations.
 
-If you discover a security vulnerability, please report it by emailing [your-email@example.com] or creating a private security advisory on GitHub.
+Release signing or hosted-service credentials are never accepted through issues or pull requests. Rotate any credential accidentally disclosed in logs or source before continuing a release.
 
-**Please do NOT report security vulnerabilities through public GitHub issues.**
+## Security boundaries
 
-When reporting a vulnerability, please include:
+- Local synchronization is one-way and additive: Rootline creates missing directories only.
+- Source and target cannot be equal, ancestors, descendants, symbolic links, or Windows junction aliases.
+- The plan is revalidated before mutation; cancellation stops between directory operations.
+- Offline profiles, directory trees, file names/content, device state, and run history remain local.
+- Optional hosted sync sends complete saved profiles, including absolute source and target paths, only after explicit sign-in and consent.
+- OIDC uses Authorization Code with PKCE. Tokens and protocol state are held behind the native Stronghold/OS credential boundary, not localStorage or React state.
+- API tenant identity comes only from the verified RS256 token subject and permission claim.
+- Production logs must not contain bearer tokens, request bodies, profile values, or absolute paths.
+- Rootline contains no usage telemetry.
 
-- Description of the vulnerability
-- Steps to reproduce the issue
-- Potential impact
-- Any suggested fixes
+## Supply-chain and stable release controls
 
-We will respond to security reports within 48 hours and provide regular updates on our progress.
+Stable npm publication is restricted to `v2.0.0`, requires npm provenance, and installs the packed CLI in isolation before publishing. Stable API deployment requires an immutable image, checked-in PostgreSQL migrations, HTTPS deployment/health endpoints, and complete production secrets. Desktop release requires Apple signing and notarization, Windows Authenticode signing, and a non-empty Tauri updater signature for every platform. Missing inputs stop the release with an actionable error; signatures are never disabled as a fallback.
 
-## Security Considerations
+## Related
 
-This tool:
-
-- Only creates directories (never modifies or deletes existing content)
-- Respects filesystem permissions
-- Does not execute any external commands
-- Does not transmit data over the network
-- Reads configuration only from local JSON files
-
-## Best Practices
-
-When using this tool:
-
-- Always use `--dry-run` first in production environments
-- Review the list of folders to be created before confirming
-- Ensure you have appropriate permissions for the target directory
-- Use version control for your configuration files
-- Regularly update to the latest version
+- [Privacy](docs/privacy.md) - Data collection and hosted profile scope.
+- [Architecture](docs/architecture.md) - Trust boundaries and ownership.
+- [Release process](docs/release.md) - Fail-closed release gates.
