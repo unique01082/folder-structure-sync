@@ -21,6 +21,14 @@ pnpm validate:workflows
 pnpm test:release
 ```
 
+## Signed candidate and public beta
+
+Run `release-desktop-candidate.yml` manually from reviewed `master` with confirmation `build-rootline-candidate`. The protected `desktop-production` environment and the same Apple, Windows, updater, Authentik, and API values used by stable release are mandatory, so candidate testing exercises the real signing and hosted-profile configuration.
+
+The default `internal` channel uploads signed/notarized workflow artifacts only. After internal QA passes, rerun with channel `public-beta` and a new tag matching `v2.0.0-beta.N`; the workflow builds that SemVer prerelease, verifies every platform signature, and creates a GitHub prerelease. It does not publish `latest.json` or change the stable updater channel. A beta installation can upgrade after the signed `2.0.0` stable updater manifest is published.
+
+Use this sequence before stable release: internal signed candidate, public beta, then the API → npm → desktop stable train. Never promote an artifact from an unreviewed branch or reuse an existing beta tag.
+
 ## npm
 
 `release-npm.yml` publishes only the public `folder-structure-sync` package. It runs only from the existing `v2.0.0` tag (with an additional exact confirmation for manual runs), checks the package version, and stops if the protected `npm-production` environment secret `NPM_TOKEN` is missing. An unprivileged job reruns quality/unit gates, installs the packed CLI in isolation, and uploads the exact tarball plus an independent checksum output. A minimal protected `npm-production` job verifies that checksum and packed identity, then exposes `NPM_TOKEN` only to `npm publish` with provenance and public access. `@rootline/core` and `@rootline/contracts` remain private workspace packages bundled into the CLI; they are never published independently.

@@ -5,7 +5,13 @@ import assert from "node:assert/strict";
 import { parse } from "yaml";
 
 const root = process.cwd();
-const workflows = ["ci.yml", "release-npm.yml", "release-api.yml", "release-desktop.yml"];
+const workflows = [
+  "ci.yml",
+  "release-npm.yml",
+  "release-api.yml",
+  "release-desktop.yml",
+  "release-desktop-candidate.yml",
+];
 
 function workflow(name) {
   return readFileSync(join(root, ".github", "workflows", name), "utf8");
@@ -225,6 +231,48 @@ test("desktop release requires platform signing and updater signing for every st
   assert.match(preflight, /base64 --decode/);
   assert.match(preflight, /private key, password, and public key do not form one updater keypair/);
   assert.doesNotMatch(preflight, /continue-on-error/);
+});
+
+test("desktop candidate workflow signs internal artifacts and can publish only an isolated prerelease", () => {
+  const name = "release-desktop-candidate.yml";
+  const candidate = workflow(name);
+  const parsed = parsedWorkflow(name);
+
+  assert.deepEqual(Object.keys(parsed.on), ["workflow_dispatch"]);
+  assert.equal(parsed.jobs.preflight.environment, "desktop-production");
+  assert.equal(parsed.jobs.preflight.steps.some((step) => String(step.run ?? "").includes("refs/heads/master")), true);
+  assert.match(candidate, /build-rootline-candidate/);
+  assert.ok(candidate.includes("grep -Eq '^v2[.]0[.]0-beta[.][0-9]+$'"));
+  assert.match(candidate, /pnpm audit --prod --audit-level high/);
+  for (const required of [
+    "APPLE_CERTIFICATE",
+    "WINDOWS_CERTIFICATE",
+    "TAURI_SIGNING_PRIVATE_KEY",
+    "TAURI_UPDATER_PUBLIC_KEY",
+    "VITE_AUTHENTIK_ISSUER",
+    "VITE_ROOTLINE_SYNC_API",
+    "universal-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "tauri signer sign",
+    "minisign -Vm",
+    "--prerelease",
+    "--target",
+  ]) assert.match(candidate, new RegExp(required.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.deepEqual(parsed.jobs["publish-beta"].needs, ["preflight", "macos-universal", "windows"]);
+  assert.equal(parsed.jobs["publish-beta"].if, "inputs.channel == 'public-beta'");
+  assert.equal(parsed.jobs["publish-beta"].permissions.contents, "write");
+  assert.deepEqual(jobScopedSecrets(name), []);
+  assert.match(candidate, /CANDIDATE_VERSION="\$\{BETA_TAG#v\}"/);
+  assert.match(candidate, /Substring\(1\)/);
+  assert.doesNotMatch(candidate, /create-updater-manifest|release-assets\/latest\.json/);
+  assert.doesNotMatch(candidate, /refs\/tags\/v2\.0\.0(?:[^-]|$)/m);
+  assert.doesNotMatch(candidate, /npm publish|docker\/build-push-action/);
+
+  const releaseDocs = readFileSync(join(root, "docs", "release.md"), "utf8");
+  assert.match(releaseDocs, /release-desktop-candidate\.yml/);
+  assert.match(releaseDocs, /internal.+public beta.+stable/is);
+  assert.match(releaseDocs, /does not publish `latest\.json`/i);
 });
 
 test("desktop updater is registered and serves every default runtime target", () => {
