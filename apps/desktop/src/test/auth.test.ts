@@ -14,14 +14,15 @@ import {
 } from "../auth";
 
 const tauriMocks = vi.hoisted(() => ({
+  getCurrent: vi.fn(async () => null as string[] | null),
   invoke: vi.fn(),
   listen: vi.fn(async () => vi.fn()),
-  onOpenUrl: vi.fn(async () => vi.fn()),
+  onOpenUrl: vi.fn(async (_handler: (urls: string[]) => void) => vi.fn()),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: tauriMocks.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: tauriMocks.listen }));
-vi.mock("@tauri-apps/plugin-deep-link", () => ({ onOpenUrl: tauriMocks.onOpenUrl }));
+vi.mock("@tauri-apps/plugin-deep-link", () => ({ getCurrent: tauriMocks.getCurrent, onOpenUrl: tauriMocks.onOpenUrl }));
 
 class MemoryAsyncStorage implements AsyncStorage {
   private readonly values = new Map<string, string>();
@@ -44,6 +45,7 @@ describe("Rootline desktop authentication boundary", () => {
 
   beforeEach(() => {
     tauriMocks.invoke.mockReset();
+    tauriMocks.getCurrent.mockReset().mockResolvedValue(null);
     tauriMocks.listen.mockReset().mockResolvedValue(vi.fn());
     tauriMocks.onOpenUrl.mockReset().mockResolvedValue(vi.fn());
   });
@@ -178,15 +180,55 @@ describe("Rootline desktop authentication boundary", () => {
     await Promise.all([auth.initialize(), auth.initialize()]);
     expect(manager.getUser).toHaveBeenCalledTimes(1);
     expect(tauriMocks.onOpenUrl).toHaveBeenCalledTimes(1);
-    expect(tauriMocks.listen).toHaveBeenCalledTimes(1);
+    expect(tauriMocks.getCurrent).toHaveBeenCalledTimes(1);
+    expect(tauriMocks.listen).not.toHaveBeenCalled();
 
     await Promise.all([
       auth.handleCallback("rootline://auth/callback?code=first&state=one"),
-      auth.handleCallback("rootline://auth/callback?code=duplicate&state=one"),
+      auth.handleCallback("rootline://auth/callback?code=first&state=one"),
     ]);
     expect(maxCallbacksInFlight).toBe(1);
     expect(auth.snapshot().user).toEqual(expect.objectContaining({ sub: "alice" }));
-    expect(auth.snapshot().error).toMatch(/already consumed/);
+    expect(manager.signinRedirectCallback).toHaveBeenCalledTimes(1);
+    expect(auth.snapshot().error).toBeUndefined();
+  });
+
+  test("installs ingress before vault loading and consumes a cached cold-start callback exactly once", async () => {
+    const callback = "rootline://auth/callback?code=cold&state=cold-state";
+    let releaseUser!: () => void;
+    const userGate = new Promise<void>((resolve) => { releaseUser = resolve; });
+    const storedUser = {
+      profile: { sub: "cold-user", permissions: ["rootline:profiles:sync"] },
+      access_token: "access", expired: false,
+    };
+    let consumed = false;
+    const manager = {
+      getUser: vi.fn(async () => { await userGate; return storedUser; }),
+      signinRedirectCallback: vi.fn(async () => {
+        if (consumed) throw new Error("state already consumed");
+        consumed = true;
+        return storedUser;
+      }),
+      signinRedirect: vi.fn(), revokeTokens: vi.fn(), removeUser: vi.fn(),
+    };
+    let liveHandler!: (urls: string[]) => void;
+    tauriMocks.onOpenUrl.mockImplementation(async (handler: (urls: string[]) => void) => {
+      liveHandler = handler;
+      return vi.fn();
+    });
+    tauriMocks.getCurrent.mockResolvedValue([callback]);
+    tauriMocks.invoke.mockResolvedValue({});
+    const auth = new DesktopAuthController(config, manager as never);
+    const initialization = auth.initialize();
+    await vi.waitFor(() => expect(tauriMocks.onOpenUrl).toHaveBeenCalledTimes(1));
+    expect(manager.getUser).not.toHaveBeenCalled();
+    liveHandler([callback]);
+    releaseUser();
+    await initialization;
+    await vi.waitFor(() => expect(manager.signinRedirectCallback).toHaveBeenCalledTimes(1));
+    expect(consumed).toBe(true);
+    expect(auth.snapshot().user).toEqual(expect.objectContaining({ sub: "cold-user" }));
+    expect(auth.snapshot().error).toBeUndefined();
   });
 
   test("surfaces vault/startup and browser launch failures without leaving the offline UI loading", async () => {
@@ -205,26 +247,24 @@ describe("Rootline desktop authentication boundary", () => {
   test("cleans a partial listener registration before retrying initialization", async () => {
     const firstDeepLinkUnlisten = vi.fn();
     const secondDeepLinkUnlisten = vi.fn();
-    const singleInstanceUnlisten = vi.fn();
     tauriMocks.onOpenUrl
       .mockResolvedValueOnce(firstDeepLinkUnlisten)
       .mockResolvedValueOnce(secondDeepLinkUnlisten);
-    tauriMocks.listen
-      .mockRejectedValueOnce(new Error("listener unavailable"))
-      .mockResolvedValueOnce(singleInstanceUnlisten);
+    tauriMocks.getCurrent
+      .mockRejectedValueOnce(new Error("cached deep links unavailable"))
+      .mockResolvedValueOnce(null);
     const manager = {
       getUser: vi.fn(async () => null), signinRedirect: vi.fn(),
       signinRedirectCallback: vi.fn(), revokeTokens: vi.fn(), removeUser: vi.fn(),
     };
     const auth = new DesktopAuthController(config, manager as never);
-    await expect(auth.initialize()).rejects.toThrow(/listener unavailable/);
+    await expect(auth.initialize()).rejects.toThrow(/cached deep links unavailable/);
     expect(firstDeepLinkUnlisten).toHaveBeenCalledTimes(1);
     await auth.initialize();
     expect(tauriMocks.onOpenUrl).toHaveBeenCalledTimes(2);
-    expect(tauriMocks.listen).toHaveBeenCalledTimes(2);
+    expect(tauriMocks.getCurrent).toHaveBeenCalledTimes(2);
     auth.dispose();
     expect(secondDeepLinkUnlisten).toHaveBeenCalledTimes(1);
-    expect(singleInstanceUnlisten).toHaveBeenCalledTimes(1);
   });
 
   test("commits account consent before scheduling best-effort hosted synchronization", async () => {
@@ -249,5 +289,31 @@ describe("Rootline desktop authentication boundary", () => {
     expect(auth.snapshot().accountClaimRequired).toBeFalsy();
     expect(tauriMocks.invoke).toHaveBeenCalledWith("sync_hosted_profiles", expect.anything());
     releaseSync();
+  });
+
+  test("surfaces when epoch adoption preserves explicitly consented unclaimed mutations", async () => {
+    const storedUser = {
+      profile: { sub: "device-two", permissions: ["rootline:profiles:sync"] },
+      access_token: "access", expired: false,
+    };
+    const manager = {
+      getUser: vi.fn(async () => storedUser), signinRedirect: vi.fn(),
+      signinRedirectCallback: vi.fn(), revokeTokens: vi.fn(), removeUser: vi.fn(),
+    };
+    tauriMocks.invoke.mockRejectedValue({
+      code: "SYNC_EPOCH_RESET_REQUIRED",
+      message: "Existing hosted account epoch found.",
+      details: {
+        epoch: "00000000-0000-4000-8000-000000000123",
+        preservesConsentedOutbox: true,
+      },
+    });
+    const auth = new DesktopAuthController(config, manager as never);
+    await auth.initialize();
+    await expect(auth.sync()).rejects.toEqual(expect.objectContaining({ code: "SYNC_EPOCH_RESET_REQUIRED" }));
+    expect(auth.snapshot()).toEqual(expect.objectContaining({
+      epochResetRequired: true,
+      epochResetPreservesConsentedOutbox: true,
+    }));
   });
 });

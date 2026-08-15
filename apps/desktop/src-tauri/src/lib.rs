@@ -15,7 +15,7 @@ use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Manager, State};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
@@ -33,6 +33,7 @@ pub enum NativeErrorCode {
     AuthCallbackInvalid,
     SyncEpochResetRequired,
     SyncAccountClaimRequired,
+    SyncStateChanged,
     Internal,
 }
 
@@ -119,29 +120,6 @@ fn auth_vault_password(app: AppHandle) -> Result<String, NativeError> {
             Ok(password)
         }
     }
-}
-
-pub fn strict_auth_callback_arg(args: &[String]) -> Option<String> {
-    args.iter().find_map(|argument| {
-        let parsed = url::Url::parse(argument).ok()?;
-        if parsed.scheme() != "rootline"
-            || parsed.host_str() != Some("auth")
-            || parsed.path() != "/callback"
-            || parsed.fragment().is_some()
-        {
-            return None;
-        }
-        let pairs: Vec<_> = parsed.query_pairs().collect();
-        let codes: Vec<_> = pairs
-            .iter()
-            .filter(|(key, value)| key == "code" && !value.is_empty())
-            .collect();
-        let states: Vec<_> = pairs
-            .iter()
-            .filter(|(key, value)| key == "state" && !value.is_empty())
-            .collect();
-        (codes.len() == 1 && states.len() == 1).then(|| argument.clone())
-    })
 }
 
 #[derive(Clone, Default)]
@@ -716,6 +694,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         3,
         include_str!("../migrations/0003_sync_session_generation.sql"),
     ),
+    (
+        4,
+        include_str!("../migrations/0004_consented_epoch_adoption.sql"),
+    ),
 ];
 const HOSTED_SYNC_MUTATION_LIMIT: usize = 100;
 const HOSTED_SYNC_BODY_LIMIT: usize = 256 * 1024;
@@ -787,8 +769,22 @@ impl Database {
                 profile.created_at, profile.updated_at],
         )?;
         transaction.execute(
-            "INSERT INTO mutation_outbox(mutation_id, kind, payload, occurred_at) VALUES (?1, 'upsert', ?2, ?3)",
-            params![Uuid::new_v4().to_string(), payload, profile.updated_at],
+            "INSERT INTO mutation_outbox(
+               mutation_id, kind, payload, occurred_at, profile_id, preserve_on_epoch_adopt
+             ) VALUES (
+               ?1, 'upsert', ?2, ?3, ?4,
+               EXISTS(SELECT 1 FROM mutation_outbox WHERE profile_id=?4 AND preserve_on_epoch_adopt=1)
+             )",
+            params![
+                Uuid::new_v4().to_string(),
+                payload,
+                profile.updated_at,
+                profile.id
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE sync_state SET session_generation=session_generation + 1 WHERE singleton=1",
+            [],
         )?;
         transaction.commit()?;
         Ok(())
@@ -820,8 +816,22 @@ impl Database {
         let transaction = connection.transaction()?;
         transaction.execute("DELETE FROM profiles WHERE id = ?1", [id])?;
         transaction.execute(
-            "INSERT INTO mutation_outbox(mutation_id, kind, payload, occurred_at) VALUES (?1, 'delete', ?2, ?3)",
-            params![Uuid::new_v4().to_string(), json!({ "profileId": id }).to_string(), timestamp()],
+            "INSERT INTO mutation_outbox(
+               mutation_id, kind, payload, occurred_at, profile_id, preserve_on_epoch_adopt
+             ) VALUES (
+               ?1, 'delete', ?2, ?3, ?4,
+               EXISTS(SELECT 1 FROM mutation_outbox WHERE profile_id=?4 AND preserve_on_epoch_adopt=1)
+             )",
+            params![
+                Uuid::new_v4().to_string(),
+                json!({ "profileId": id }).to_string(),
+                timestamp(),
+                id
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE sync_state SET session_generation=session_generation + 1 WHERE singleton=1",
+            [],
         )?;
         transaction.commit()?;
         Ok(())
@@ -834,9 +844,21 @@ impl Database {
         payload: &str,
         occurred_at: &str,
     ) -> Result<(), NativeError> {
+        let parsed: serde_json::Value = serde_json::from_str(payload).map_err(internal_error)?;
+        let profile_id = parsed
+            .get(if kind == "upsert" { "id" } else { "profileId" })
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "A local outbox mutation is invalid.",
+                )
+            })?;
         self.connection().execute(
-            "INSERT OR IGNORE INTO mutation_outbox(mutation_id, kind, payload, occurred_at) VALUES (?1, ?2, ?3, ?4)",
-            params![id, kind, payload, occurred_at],
+            "INSERT OR IGNORE INTO mutation_outbox(
+               mutation_id, kind, payload, occurred_at, profile_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, kind, payload, occurred_at, profile_id],
         )?;
         Ok(())
     }
@@ -905,9 +927,11 @@ impl Database {
         cursor: &str,
     ) -> Result<(), NativeError> {
         self.connection().execute(
-            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation) VALUES (1, ?1, ?2, ?3, 1)
+            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation, preserve_outbox_on_epoch_adopt)
+             VALUES (1, ?1, ?2, ?3, 1, 0)
              ON CONFLICT(singleton) DO UPDATE SET subject=excluded.subject, epoch=excluded.epoch,
-             cursor=excluded.cursor, session_generation=sync_state.session_generation + 1",
+             cursor=excluded.cursor, session_generation=sync_state.session_generation + 1,
+             preserve_outbox_on_epoch_adopt=0",
             params![subject, epoch, cursor],
         )?;
         Ok(())
@@ -931,10 +955,10 @@ impl Database {
         let transaction = connection.transaction()?;
         transaction.execute("DELETE FROM mutation_outbox", [])?;
         transaction.execute(
-            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation)
-             VALUES (1, '', '', '', 1)
+            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation, preserve_outbox_on_epoch_adopt)
+             VALUES (1, '', '', '', 1, 0)
              ON CONFLICT(singleton) DO UPDATE SET subject='', epoch='', cursor='',
-             session_generation=sync_state.session_generation + 1",
+             session_generation=sync_state.session_generation + 1, preserve_outbox_on_epoch_adopt=0",
             [],
         )?;
         if remove_local_profiles {
@@ -979,13 +1003,17 @@ impl Database {
         }
         if !upload_existing {
             transaction.execute("DELETE FROM mutation_outbox", [])?;
+        } else {
+            transaction.execute("UPDATE mutation_outbox SET preserve_on_epoch_adopt=1", [])?;
         }
         let epoch = Uuid::new_v4().to_string();
         transaction.execute(
-            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation) VALUES (1, ?1, ?2, '', 1)
+            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation, preserve_outbox_on_epoch_adopt)
+             VALUES (1, ?1, ?2, '', 1, ?3)
              ON CONFLICT(singleton) DO UPDATE SET subject=excluded.subject, epoch=excluded.epoch,
-             cursor='', session_generation=sync_state.session_generation + 1",
-            params![subject, epoch],
+             cursor='', session_generation=sync_state.session_generation + 1,
+             preserve_outbox_on_epoch_adopt=excluded.preserve_outbox_on_epoch_adopt",
+            params![subject, epoch, i64::from(upload_existing)],
         )?;
         transaction.commit()?;
         Ok(())
@@ -999,18 +1027,54 @@ impl Database {
     ) -> Result<(), NativeError> {
         let mut connection = self.connection();
         let transaction = connection.transaction()?;
-        transaction.execute("DELETE FROM mutation_outbox", [])?;
+        let preserve_consented_outbox = !remove_local_profiles
+            && transaction
+                .query_row(
+                    "SELECT EXISTS(
+                    SELECT 1 FROM mutation_outbox WHERE preserve_on_epoch_adopt=1
+                 ) FROM sync_state
+                 WHERE singleton=1 AND subject=?1 AND preserve_outbox_on_epoch_adopt=1",
+                    [subject],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                == Some(1);
+        if preserve_consented_outbox {
+            transaction.execute(
+                "DELETE FROM mutation_outbox WHERE preserve_on_epoch_adopt=0",
+                [],
+            )?;
+        } else {
+            transaction.execute("DELETE FROM mutation_outbox", [])?;
+        }
         if remove_local_profiles {
             transaction.execute("DELETE FROM profiles", [])?;
         }
         transaction.execute(
-            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation) VALUES (1, ?1, ?2, '', 1)
+            "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation, preserve_outbox_on_epoch_adopt)
+             VALUES (1, ?1, ?2, '', 1, 0)
              ON CONFLICT(singleton) DO UPDATE SET subject=excluded.subject, epoch=excluded.epoch,
-             cursor='', session_generation=sync_state.session_generation + 1",
-            params![subject, epoch],
+             cursor='', session_generation=sync_state.session_generation + 1,
+             preserve_outbox_on_epoch_adopt=CASE WHEN ?3 THEN 1 ELSE 0 END",
+            params![subject, epoch, preserve_consented_outbox],
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn preserves_consented_outbox(&self, subject: &str) -> Result<bool, NativeError> {
+        Ok(self
+            .connection()
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM mutation_outbox WHERE preserve_on_epoch_adopt=1
+                 ) FROM sync_state
+                 WHERE singleton=1 AND subject=?1 AND preserve_outbox_on_epoch_adopt=1",
+                [subject],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            == Some(1))
     }
 
     pub fn accept_account_epoch_if_current(
@@ -1040,7 +1104,7 @@ impl Database {
             ))
         {
             return Err(NativeError::new(
-                NativeErrorCode::Internal,
+                NativeErrorCode::SyncStateChanged,
                 "Hosted sync state changed; the stale account response was discarded.",
             ));
         }
@@ -1049,7 +1113,8 @@ impl Database {
             transaction.execute("DELETE FROM profiles", [])?;
         }
         transaction.execute(
-            "UPDATE sync_state SET epoch=?1, cursor='', session_generation=session_generation + 1
+            "UPDATE sync_state SET epoch=?1, cursor='', session_generation=session_generation + 1,
+             preserve_outbox_on_epoch_adopt=0
              WHERE singleton=1 AND subject=?2 AND epoch=?3 AND cursor=?4 AND session_generation=?5",
             params![
                 next_epoch,
@@ -1233,9 +1298,24 @@ impl Database {
                 ))
         {
             return Err(NativeError::new(
-                NativeErrorCode::Internal,
+                NativeErrorCode::SyncStateChanged,
                 "Hosted sync state changed; the stale response was discarded.",
             ));
+        }
+        for receipt in receipts {
+            let mutation_id = receipt
+                .get("mutationId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::Internal,
+                        "A hosted mutation receipt is invalid.",
+                    )
+                })?;
+            transaction.execute(
+                "DELETE FROM mutation_outbox WHERE mutation_id = ?1",
+                [mutation_id],
+            )?;
         }
         for record in records {
             match record.get("kind").and_then(serde_json::Value::as_str) {
@@ -1249,6 +1329,14 @@ impl Database {
                         })?,
                     )
                     .map_err(internal_error)?;
+                    let has_pending_local_mutation: i64 = transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM mutation_outbox WHERE profile_id=?1)",
+                        [&profile.id],
+                        |row| row.get(0),
+                    )?;
+                    if has_pending_local_mutation == 1 {
+                        continue;
+                    }
                     transaction.execute(
                         "INSERT INTO profiles(id, name, source_path, target_path, exclusions_json, created_at, updated_at)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -1268,6 +1356,14 @@ impl Database {
                                 "A hosted tombstone is invalid.",
                             )
                         })?;
+                    let has_pending_local_mutation: i64 = transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM mutation_outbox WHERE profile_id=?1)",
+                        [profile_id],
+                        |row| row.get(0),
+                    )?;
+                    if has_pending_local_mutation == 1 {
+                        continue;
+                    }
                     transaction.execute("DELETE FROM profiles WHERE id = ?1", [profile_id])?;
                 }
                 _ => {
@@ -1278,29 +1374,20 @@ impl Database {
                 }
             }
         }
-        for receipt in receipts {
-            let mutation_id = receipt
-                .get("mutationId")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    NativeError::new(
-                        NativeErrorCode::Internal,
-                        "A hosted mutation receipt is invalid.",
-                    )
-                })?;
-            transaction.execute(
-                "DELETE FROM mutation_outbox WHERE mutation_id = ?1",
-                [mutation_id],
-            )?;
-        }
         let updated = transaction.execute(
-            "UPDATE sync_state SET cursor = ?1
+            "UPDATE sync_state SET cursor = ?1,
+             preserve_outbox_on_epoch_adopt=CASE
+               WHEN EXISTS(
+                 SELECT 1 FROM mutation_outbox WHERE preserve_on_epoch_adopt=1
+               ) THEN preserve_outbox_on_epoch_adopt
+               ELSE 0
+             END
              WHERE singleton = 1 AND subject = ?2 AND epoch = ?3 AND cursor = ?4 AND session_generation = ?5",
             params![cursor, expected_subject, expected_epoch, expected_cursor, expected_generation],
         )?;
         if updated != 1 {
             return Err(NativeError::new(
-                NativeErrorCode::Internal,
+                NativeErrorCode::SyncStateChanged,
                 "Hosted sync state changed; the stale response was discarded.",
             ));
         }
@@ -1558,15 +1645,24 @@ async fn sync_hosted_profiles(
             && body.get("code").and_then(serde_json::Value::as_str)
                 == Some("SYNC_EPOCH_RESET_REQUIRED")
         {
+            let preserves_consented_outbox = database.preserves_consented_outbox(&subject)?;
             return Err(NativeError {
                 code: NativeErrorCode::SyncEpochResetRequired,
-                message:
+                message: if preserves_consented_outbox {
+                    "This account already has hosted data. Review the explicitly consented local profiles before uploading."
+                } else {
                     "Hosted profile data was reset. Review this device before uploading again."
-                        .into(),
+                }
+                .into(),
                 details: body
                     .get("epoch")
                     .cloned()
-                    .map(|epoch| json!({ "epoch": epoch })),
+                    .map(|epoch| {
+                        json!({
+                            "epoch": epoch,
+                            "preservesConsentedOutbox": preserves_consented_outbox
+                        })
+                    }),
             });
         }
         if !status.is_success() {
@@ -1579,6 +1675,22 @@ async fn sync_hosted_profiles(
                 "Hosted sync was rejected; local data remains safe.",
             ));
         }
+        let response_cursor = body
+            .get("cursor")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        match database.apply_hosted_sync_response(
+            &subject,
+            &expected_epoch,
+            &expected_cursor,
+            expected_generation,
+            &body,
+        ) {
+            Ok(()) => {}
+            Err(error) if error.code == NativeErrorCode::SyncStateChanged => continue,
+            Err(error) => return Err(error),
+        }
         acknowledged += body
             .get("receipts")
             .and_then(serde_json::Value::as_array)
@@ -1587,18 +1699,6 @@ async fn sync_hosted_profiles(
             .get("records")
             .and_then(serde_json::Value::as_array)
             .map_or(0, Vec::len);
-        let response_cursor = body
-            .get("cursor")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        database.apply_hosted_sync_response(
-            &subject,
-            &expected_epoch,
-            &expected_cursor,
-            expected_generation,
-            &body,
-        )?;
         let has_more = body
             .get("hasMore")
             .and_then(serde_json::Value::as_bool)
@@ -1760,12 +1860,9 @@ async fn delete_hosted_account_data(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            if let Some(url) = strict_auth_callback_arg(&args) {
-                let _ = app.emit("rootline-auth-deep-link", url);
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.set_focus();
-                }
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_focus();
             }
         }))
         .plugin(tauri_plugin_deep_link::init())

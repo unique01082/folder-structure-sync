@@ -62,6 +62,27 @@ test("requires an explicit keep-or-remove decision after an epoch reset", async 
   expect(auth.resolveEpochReset).toHaveBeenCalledWith(false);
 });
 
+test("explains that accepting an existing epoch keeps explicitly consented device profiles queued", async () => {
+  const user = userEvent.setup();
+  const state = {
+    configured: true, loading: false, dataVersion: 0, epochResetRequired: true,
+    epochResetPreservesConsentedOutbox: true,
+    user: { sub: "device-two", permissions: ["rootline:profiles:sync"] },
+  } as AuthSnapshot & { epochResetPreservesConsentedOutbox: boolean };
+  const auth = {
+    snapshot: () => state,
+    subscribe: (listener: (snapshot: AuthSnapshot) => void) => { listener(state); return () => undefined; },
+    initialize: vi.fn(async () => undefined), signIn: vi.fn(async () => undefined),
+    handleCallback: vi.fn(async () => undefined), signOut: vi.fn(async () => undefined),
+    deleteAccountData: vi.fn(async () => undefined), resolveEpochReset: vi.fn(async () => undefined),
+    resolveAccountClaim: vi.fn(async () => undefined), sync: vi.fn(async () => undefined), dispose: vi.fn(),
+  } satisfies AuthController;
+  render(<AuthControls auth={auth} />);
+  await user.click(screen.getByRole("button", { name: "Review reset" }));
+  expect(screen.getByRole("dialog", { name: "Hosted reset options" }))
+    .toHaveTextContent(/explicitly consented.*remain queued.*uploaded/i);
+});
+
 test("requires explicit consent before existing absolute-path profiles are claimed by an account", async () => {
   const user = userEvent.setup();
   const state: AuthSnapshot = {

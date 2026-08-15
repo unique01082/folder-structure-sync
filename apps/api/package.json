@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/main.js",
-    "test": "vitest run",
+    "test": "sh scripts/test-e2e-postgres.sh",
     "test:e2e": "vitest run test/sync.e2e.spec.ts",
     "test:e2e:postgres": "sh scripts/test-e2e-postgres.sh",
     "typecheck": "tsc -p tsconfig.json --noEmit",

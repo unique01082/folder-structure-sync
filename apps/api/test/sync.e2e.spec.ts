@@ -1,7 +1,10 @@
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
+import { execFile } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import request from "supertest";
 import { Logger } from "@nestjs/common";
 import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
@@ -12,11 +15,13 @@ const ISSUER = "https://auth.baole.space/application/o/rootline/";
 const AUDIENCE = "rootline-desktop";
 const EPOCH = "00000000-0000-4000-8000-000000000001";
 const PROFILE_ID = "profile-existing-task3";
+const execFileAsync = promisify(execFile);
 
 describe("Rootline hosted sync (real PostgreSQL)", () => {
   let fixture: TestApplication;
   let directory: string;
   let privateKey: CryptoKey;
+  let apiUrl: string;
 
   beforeAll(async () => {
     if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL must point to a real PostgreSQL test database");
@@ -34,6 +39,10 @@ describe("Rootline hosted sync (real PostgreSQL)", () => {
       jwksPath,
       rateLimit: 60,
     });
+    await fixture.app.listen(0, "127.0.0.1");
+    const address = fixture.server.address();
+    if (!address || typeof address === "string") throw new Error("Test API did not bind a TCP port");
+    apiUrl = `http://127.0.0.1:${address.port}`;
     await fixture.resetDatabase();
   });
 
@@ -132,6 +141,37 @@ describe("Rootline hosted sync (real PostgreSQL)", () => {
       .send({ deviceId: "delta-c", epoch: EPOCH, cursor: delta.body.cursor, mutations: [] }).expect(200);
     expect(empty.body.records).toEqual([]);
   });
+
+  test("replays a real desktop SQLite device-two outbox through Nest and PostgreSQL without cross-account path leakage", async () => {
+    const alice = await token("seam-alice");
+    const bob = await token("seam-bob");
+    await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${alice}`)
+      .send({
+        deviceId: "device-one",
+        epoch: EPOCH,
+        mutations: [mutation("device-one-profile", "Device one", "00000000-0000-4000-8008-000000000001")],
+      }).expect(200);
+
+    const manifest = fileURLToPath(new URL("../../desktop/src-tauri/Cargo.toml", import.meta.url));
+    await execFileAsync("cargo", [
+      "test", "--manifest-path", manifest, "--test", "hosted_sync_postgres", "--", "--ignored", "--nocapture",
+    ], {
+      env: {
+        ...process.env,
+        ROOTLINE_E2E_API_URL: apiUrl,
+        ROOTLINE_E2E_ALICE_TOKEN: alice,
+        ROOTLINE_E2E_BOB_TOKEN: bob,
+      },
+      maxBuffer: 2 * 1024 * 1024,
+      timeout: 180_000,
+    });
+
+    const aliceRecords = await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${alice}`)
+      .send({ deviceId: "verification-device", epoch: EPOCH, mutations: [] }).expect(200);
+    expect(aliceRecords.body.records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "profile", profile: expect.objectContaining({ id: "device-two-offline-profile" }) }),
+    ]));
+  }, 180_000);
 
   test("rotates epoch on account deletion and rejects stale-device resurrection", async () => {
     const auth = await token("reset-user");

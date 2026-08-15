@@ -45,6 +45,7 @@ test("public domain and cloud contracts retain their transport shapes", () => {
     | "PROFILE_CONFLICT"
     | "SYNC_EPOCH_RESET_REQUIRED"
     | "SYNC_ACCOUNT_CLAIM_REQUIRED"
+    | "SYNC_STATE_CHANGED"
     | "RATE_LIMITED"
     | "VALIDATION_FAILED"
     | "INTERNAL"

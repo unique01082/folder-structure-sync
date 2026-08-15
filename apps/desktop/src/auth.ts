@@ -1,7 +1,7 @@
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { appDataDir, join } from "@tauri-apps/api/path";
-import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
+import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Stronghold, type Store } from "@tauri-apps/plugin-stronghold";
 import {
@@ -41,6 +41,7 @@ export interface AuthSnapshot {
   dataVersion: number;
   accountClaimRequired?: boolean;
   epochResetRequired?: boolean;
+  epochResetPreservesConsentedOutbox?: boolean;
   error?: string;
 }
 
@@ -202,6 +203,7 @@ export class DesktopAuthController implements AuthController {
   private initialized = false;
   private initializationFlight: { generation: number; promise: Promise<void> } | undefined;
   private callbackQueue: Promise<void> = Promise.resolve();
+  private readonly processedCallbackStates = new Set<string>();
 
   constructor(private readonly config: OidcConfiguration, manager?: UserManager) {
     if (manager) {
@@ -244,23 +246,20 @@ export class DesktopAuthController implements AuthController {
   }
 
   private async initializeOnce(generation: number): Promise<void> {
-    const user = await this.manager.getUser();
-    if (generation !== this.initialization) return;
-    this.update({ configured: true, loading: false, user: user ? projectUser(user) : null, dataVersion: this.current.dataVersion });
     let deepLink: UnlistenFn | undefined;
-    let singleInstance: UnlistenFn | undefined;
     try {
       deepLink = await onOpenUrl((urls) => { for (const url of urls) void this.handleCallback(url); });
       if (generation !== this.initialization) return;
-      singleInstance = await listen<string>("rootline-auth-deep-link", (event) => { void this.handleCallback(event.payload); });
+      for (const url of await getCurrent() ?? []) await this.handleCallback(url);
       if (generation !== this.initialization) return;
-      this.unlisteners.push(deepLink, singleInstance);
+      const user = await this.manager.getUser();
+      if (generation !== this.initialization) return;
+      this.update({ configured: true, loading: false, user: user ? projectUser(user) : this.current.user, dataVersion: this.current.dataVersion });
+      this.unlisteners.push(deepLink);
       deepLink = undefined;
-      singleInstance = undefined;
       this.initialized = true;
     } finally {
       deepLink?.();
-      singleInstance?.();
     }
   }
 
@@ -287,6 +286,9 @@ export class DesktopAuthController implements AuthController {
   private async processCallback(rawUrl: string): Promise<void> {
     try {
       const url = validateCallbackUrl(rawUrl);
+      const state = url.searchParams.get("state")!;
+      if (this.processedCallbackStates.has(state)) return;
+      this.processedCallbackStates.add(state);
       const user = await this.manager.signinRedirectCallback(url.toString());
       this.update({ configured: true, loading: false, user: projectUser(user), dataVersion: this.current.dataVersion });
       try { await this.sync(); } catch { /* sync() already surfaces reset-required; offline sign-in remains valid */ }
@@ -358,13 +360,14 @@ export class DesktopAuthController implements AuthController {
       await invoke("sync_hosted_profiles", { apiUrl: this.config.apiUrl, accessToken: user.access_token, subject: user.profile.sub });
       this.update({ ...this.current, dataVersion: this.current.dataVersion + 1 });
     } catch (error) {
-      const value = error as { code?: unknown; message?: unknown; details?: { epoch?: unknown } };
+      const value = error as { code?: unknown; message?: unknown; details?: { epoch?: unknown; preservesConsentedOutbox?: unknown } };
       if (value?.code === "SYNC_EPOCH_RESET_REQUIRED" && typeof value.details?.epoch === "string") {
         this.resetEpoch = value.details.epoch;
         this.update({
           ...this.current,
           loading: false,
           epochResetRequired: true,
+          epochResetPreservesConsentedOutbox: value.details.preservesConsentedOutbox === true,
           error: typeof value.message === "string" ? value.message : "Hosted profile data was reset.",
         });
       } else if (value?.code === "SYNC_ACCOUNT_CLAIM_REQUIRED") {

@@ -18,7 +18,7 @@ Production registration is an external deployment gate. Create an Authentik OAut
 | **Permission claim** | `rootline:profiles:sync` in the `permissions` array |
 | **Signing algorithm** | RS256 |
 
-Do not issue or embed a client secret. The desktop opens the system browser and validates the exact callback scheme, host, path, state, PKCE verifier, and OIDC nonce before accepting a session. OIDC state and tokens use Tauri Stronghold; the per-install random vault password is stored in the operating-system credential manager, never browser storage or React component state.
+Do not issue or embed a client secret. The desktop opens the system browser and validates the exact callback scheme, host, path, state, PKCE verifier, and OIDC nonce before accepting a session. The Tauri deep-link listener is installed before vault loading, cached cold-start URLs are read with `getCurrent`, and each callback state is consumed once. The deep-link plugin is the only URL delivery path, including Windows single-instance forwarding. OIDC state and tokens use Tauri Stronghold; the per-install random vault password is stored in the operating-system credential manager, never browser storage or React component state.
 
 Set all three desktop build variables together:
 
@@ -32,7 +32,9 @@ When all are absent, account controls are disabled and offline use continues. If
 
 Profiles saved before the first sign-in remain unclaimed. Because they contain absolute paths, Rootline requires an explicit **Upload existing profiles** or **Keep local only** decision before binding their outbox to an OIDC subject. Signing out always removes that subject's cursor and queued mutations; choosing to keep local profiles does not make them eligible for a later account automatically. A different account therefore cannot inherit the previous account's paths or cursor.
 
-Native sync calls are serialized. Each request captures the verified subject plus the local epoch, starting cursor, and session generation; the response must still match all four values inside the same SQLite transaction before any profile, receipt, or cursor is applied. Sign-out, account changes, and epoch acceptance advance the generation, so delayed or out-of-order responses are discarded. Repeating an already committed claim for the same subject is idempotent.
+If a second device explicitly consents to upload pre-login profiles but discovers an existing server epoch, accepting that epoch preserves only those consented, not-yet-cloud-owned mutation chains. Each mutation keeps that provenance until its own successful receipt. An edit or deletion of the same consented profile before adoption inherits the marker, preserving order and preventing an older upsert from overwriting or resurrecting it; unrelated edits queued after account binding are cloud-owned and are discarded by a later reset. Once every consented chain is acknowledged, later reset adoption clears the outbox so deleted hosted data cannot be resurrected.
+
+Native sync calls are serialized. Each request captures the verified subject plus the local epoch, starting cursor, and session generation; the response must still match all four values inside the same SQLite transaction before any profile, receipt, or cursor is applied. Sign-out, account changes, epoch acceptance, and local profile save/delete transactions advance the generation, so delayed or out-of-order records cannot overwrite or resurrect newer local state. After receipts are removed, a response also skips any profile or tombstone that still has a pending local mutation in a later batch. A generation change makes the active loop discard that response and replay the still-queued mutation. Repeating an already committed claim for the same subject is idempotent.
 
 ## API deployment
 
@@ -82,6 +84,14 @@ For a reproducible local integration run, Docker can provision a disposable Post
 ```bash
 pnpm --filter @rootline/api test:e2e:postgres
 ```
+
+The root test command uses that same provision/migrate/test/cleanup harness automatically and needs no pre-existing `DATABASE_URL`:
+
+```bash
+pnpm test
+```
+
+The API suite includes a real seam test that starts from the desktop's SQLite profile/outbox, adopts an existing device-one server epoch, reconnects through NestJS/PostgreSQL, verifies receipts, and proves the absolute path is not sent to a different OIDC subject.
 
 ## Operator validation
 

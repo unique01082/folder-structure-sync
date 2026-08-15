@@ -2,8 +2,7 @@ use std::fs;
 
 use rootline_desktop::{
     apply_plan, detect_case_sensitive, random_vault_password, resolve_existing_vault_password,
-    scan_plan, strict_auth_callback_arg, CancellationToken, Database, DirectoryStatus,
-    NativeErrorCode, Profile, ScanRequest,
+    scan_plan, CancellationToken, Database, DirectoryStatus, NativeErrorCode, Profile, ScanRequest,
 };
 use rusqlite::Connection;
 use tempfile::tempdir;
@@ -259,25 +258,6 @@ fn refuses_to_replace_a_missing_os_key_for_an_existing_stronghold_snapshot() {
 }
 
 #[test]
-fn filters_single_instance_arguments_to_the_exact_auth_callback() {
-    assert_eq!(
-        strict_auth_callback_arg(&[
-            "rootline".into(),
-            "rootline://auth/callback?code=x&state=y".into()
-        ]),
-        Some("rootline://auth/callback?code=x&state=y".into()),
-    );
-    for invalid in [
-        "https://auth/callback?code=x&state=y",
-        "rootline://evil/callback?code=x&state=y",
-        "rootline://auth/callback/extra?code=x&state=y",
-        "rootline://auth/callback?state=y",
-    ] {
-        assert_eq!(strict_auth_callback_arg(&[invalid.into()]), None);
-    }
-}
-
-#[test]
 fn clearing_synced_local_data_is_explicit_and_keeps_run_history() {
     let directory = tempdir().unwrap();
     let database = Database::open(directory.path().join("clear.sqlite3")).unwrap();
@@ -458,6 +438,99 @@ fn hosted_outbox_batches_offline_replay_within_api_count_and_body_limits() {
 }
 
 #[test]
+fn first_batch_response_cannot_overwrite_a_same_profile_edit_queued_in_the_next_batch() {
+    let directory = tempdir().unwrap();
+    let database = Database::open(directory.path().join("batch-edit-fence.sqlite3")).unwrap();
+    database.hosted_sync_request("alice").unwrap();
+    let mut profile = Profile {
+        id: "batch-profile".into(),
+        name: String::new(),
+        source_path: "/batch/source".into(),
+        target_path: "/batch/target".into(),
+        exclusions: vec![],
+        created_at: "2026-08-15T00:00:00Z".into(),
+        updated_at: "2026-08-15T00:00:00Z".into(),
+    };
+    for index in 0..=100 {
+        profile.name = format!("Local {index}");
+        profile.updated_at = format!("2026-08-15T00:{:02}:00Z", index % 60);
+        database.save_profile(&profile).unwrap();
+    }
+    let first = database.hosted_sync_request("alice").unwrap();
+    assert_eq!(first["mutations"].as_array().unwrap().len(), 100);
+    let epoch = first["epoch"].as_str().unwrap();
+    let generation = database.hosted_sync_generation("alice", epoch, "").unwrap();
+    let server_profile = first["mutations"][99]["profile"].clone();
+    database
+        .apply_hosted_sync_response(
+            "alice",
+            epoch,
+            "",
+            generation,
+            &serde_json::json!({
+                "epoch": epoch,
+                "cursor": "batch-one",
+                "hasMore": false,
+                "records": [{ "kind": "profile", "revision": 100, "profile": server_profile }],
+                "receipts": first["mutations"].as_array().unwrap().iter().enumerate().map(|(index, mutation)| {
+                    serde_json::json!({ "mutationId": mutation["mutationId"], "revision": index + 1 })
+                }).collect::<Vec<_>>()
+            }),
+        )
+        .unwrap();
+    assert_eq!(database.list_profiles().unwrap()[0].name, "Local 100");
+    assert_eq!(database.pending_outbox().unwrap().len(), 1);
+}
+
+#[test]
+fn first_batch_response_cannot_resurrect_a_delete_queued_in_the_next_batch() {
+    let directory = tempdir().unwrap();
+    let database = Database::open(directory.path().join("batch-delete-fence.sqlite3")).unwrap();
+    database.hosted_sync_request("alice").unwrap();
+    let mut profile = Profile {
+        id: "batch-profile".into(),
+        name: String::new(),
+        source_path: "/batch/source".into(),
+        target_path: "/batch/target".into(),
+        exclusions: vec![],
+        created_at: "2026-08-15T00:00:00Z".into(),
+        updated_at: "2026-08-15T00:00:00Z".into(),
+    };
+    for index in 0..100 {
+        profile.name = format!("Local {index}");
+        profile.updated_at = format!("2026-08-15T00:{:02}:00Z", index % 60);
+        database.save_profile(&profile).unwrap();
+    }
+    database.delete_profile(&profile.id).unwrap();
+    let first = database.hosted_sync_request("alice").unwrap();
+    assert_eq!(first["mutations"].as_array().unwrap().len(), 100);
+    let epoch = first["epoch"].as_str().unwrap();
+    let generation = database.hosted_sync_generation("alice", epoch, "").unwrap();
+    let server_profile = first["mutations"][99]["profile"].clone();
+    database
+        .apply_hosted_sync_response(
+            "alice",
+            epoch,
+            "",
+            generation,
+            &serde_json::json!({
+                "epoch": epoch,
+                "cursor": "batch-one",
+                "hasMore": false,
+                "records": [{ "kind": "profile", "revision": 100, "profile": server_profile }],
+                "receipts": first["mutations"].as_array().unwrap().iter().enumerate().map(|(index, mutation)| {
+                    serde_json::json!({ "mutationId": mutation["mutationId"], "revision": index + 1 })
+                }).collect::<Vec<_>>()
+            }),
+        )
+        .unwrap();
+    assert!(database.list_profiles().unwrap().is_empty());
+    let pending = database.pending_outbox().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].kind, "delete");
+}
+
+#[test]
 fn delayed_sync_responses_are_fenced_after_disconnect_switch_reset_and_out_of_order_apply() {
     let directory = tempdir().unwrap();
     let database = Database::open(directory.path().join("fenced.sqlite3")).unwrap();
@@ -580,6 +653,325 @@ fn claiming_the_same_subject_twice_preserves_the_committed_epoch() {
         database.hosted_sync_request("alice").unwrap()["epoch"],
         epoch
     );
+}
+
+#[test]
+fn local_save_invalidates_an_inflight_response_before_it_can_overwrite_the_new_profile() {
+    let directory = tempdir().unwrap();
+    let database = Database::open(directory.path().join("save-race.sqlite3")).unwrap();
+    let mut profile = Profile {
+        id: "profile-race-save".into(),
+        name: "Before request".into(),
+        source_path: "/new/local/source".into(),
+        target_path: "/new/local/target".into(),
+        exclusions: vec![],
+        created_at: "2026-08-15T00:00:00Z".into(),
+        updated_at: "2026-08-15T00:00:00Z".into(),
+    };
+    database.save_profile(&profile).unwrap();
+    database.claim_hosted_account("alice", true).unwrap();
+    let request = database.hosted_sync_request("alice").unwrap();
+    let epoch = request["epoch"].as_str().unwrap().to_owned();
+    let generation = database
+        .hosted_sync_generation("alice", &epoch, "")
+        .unwrap();
+
+    profile.name = "Edited while response was delayed".into();
+    profile.updated_at = "2026-08-15T01:00:00Z".into();
+    database.save_profile(&profile).unwrap();
+    let stale = serde_json::json!({
+        "epoch": epoch, "cursor": "stale-save", "hasMore": false,
+        "records": [{
+            "kind": "profile", "revision": 1,
+            "profile": {
+                "id": profile.id, "name": "Remote stale value", "sourcePath": "/remote/stale",
+                "targetPath": "/remote/stale", "exclusions": [],
+                "createdAt": profile.created_at, "updatedAt": "2026-08-14T00:00:00Z"
+            }
+        }],
+        "receipts": [{ "mutationId": request["mutations"][0]["mutationId"], "revision": 1 }]
+    });
+    assert_eq!(
+        database
+            .apply_hosted_sync_response("alice", &epoch, "", generation, &stale)
+            .unwrap_err()
+            .code,
+        NativeErrorCode::SyncStateChanged,
+    );
+    assert_eq!(database.list_profiles().unwrap(), [profile.clone()]);
+    let replay = database.hosted_sync_request("alice").unwrap();
+    assert_eq!(replay["mutations"].as_array().unwrap().len(), 2);
+    assert!(replay
+        .to_string()
+        .contains("Edited while response was delayed"));
+}
+
+#[test]
+fn local_delete_invalidates_an_inflight_profile_before_it_can_resurrect_the_profile() {
+    let directory = tempdir().unwrap();
+    let database = Database::open(directory.path().join("delete-race.sqlite3")).unwrap();
+    let profile = Profile {
+        id: "profile-race-delete".into(),
+        name: "Delete locally".into(),
+        source_path: "/source".into(),
+        target_path: "/target".into(),
+        exclusions: vec![],
+        created_at: "2026-08-15T00:00:00Z".into(),
+        updated_at: "2026-08-15T00:00:00Z".into(),
+    };
+    database.save_profile(&profile).unwrap();
+    database.claim_hosted_account("alice", true).unwrap();
+    let initial = database.hosted_sync_request("alice").unwrap();
+    let epoch = initial["epoch"].as_str().unwrap().to_owned();
+    let initial_generation = database
+        .hosted_sync_generation("alice", &epoch, "")
+        .unwrap();
+    database
+        .apply_hosted_sync_response(
+            "alice",
+            &epoch,
+            "",
+            initial_generation,
+            &serde_json::json!({
+                "epoch": epoch, "cursor": "cursor-before-delete", "hasMore": false,
+                "records": [],
+                "receipts": [{ "mutationId": initial["mutations"][0]["mutationId"], "revision": 1 }]
+            }),
+        )
+        .unwrap();
+    let request = database.hosted_sync_request("alice").unwrap();
+    let generation = database
+        .hosted_sync_generation("alice", &epoch, "cursor-before-delete")
+        .unwrap();
+
+    database.delete_profile(&profile.id).unwrap();
+    assert_eq!(
+        database
+            .apply_hosted_sync_response(
+                "alice",
+                &epoch,
+                "cursor-before-delete",
+                generation,
+                &serde_json::json!({
+                    "epoch": epoch, "cursor": "stale-delete", "hasMore": false,
+                    "records": [{ "kind": "profile", "revision": 2, "profile": profile }],
+                    "receipts": []
+                })
+            )
+            .unwrap_err()
+            .code,
+        NativeErrorCode::SyncStateChanged,
+    );
+    assert!(database.list_profiles().unwrap().is_empty());
+    let replay = database.hosted_sync_request("alice").unwrap();
+    assert_eq!(replay["mutations"][0]["kind"], "delete");
+    assert_eq!(request["mutations"], serde_json::json!([]));
+}
+
+#[test]
+fn adopting_an_existing_server_epoch_preserves_only_explicitly_consented_unclaimed_outbox() {
+    let directory = tempdir().unwrap();
+    let database = Database::open(directory.path().join("epoch-adoption.sqlite3")).unwrap();
+    let profile = Profile {
+        id: "device-two-local".into(),
+        name: "Explicitly consented".into(),
+        source_path: "/device-two/private".into(),
+        target_path: "/device-two/backup".into(),
+        exclusions: vec![],
+        created_at: "2026-08-15T00:00:00Z".into(),
+        updated_at: "2026-08-15T00:00:00Z".into(),
+    };
+    database.save_profile(&profile).unwrap();
+    database.claim_hosted_account("alice", true).unwrap();
+    database
+        .accept_account_epoch("alice", "00000000-0000-4000-8000-000000000111", false)
+        .unwrap();
+    let adopted = database.hosted_sync_request("alice").unwrap();
+    assert_eq!(adopted["mutations"].as_array().unwrap().len(), 1);
+    assert!(adopted.to_string().contains("/device-two/private"));
+
+    let epoch = adopted["epoch"].as_str().unwrap().to_owned();
+    let generation = database
+        .hosted_sync_generation("alice", &epoch, "")
+        .unwrap();
+    database
+        .apply_hosted_sync_response(
+            "alice",
+            &epoch,
+            "",
+            generation,
+            &serde_json::json!({
+                "epoch": epoch, "cursor": "cloud-owned", "hasMore": false, "records": [],
+                "receipts": [{ "mutationId": adopted["mutations"][0]["mutationId"], "revision": 1 }]
+            }),
+        )
+        .unwrap();
+    database
+        .save_profile(&Profile {
+            name: "Cloud-owned edit".into(),
+            ..profile
+        })
+        .unwrap();
+    database
+        .accept_account_epoch("alice", "00000000-0000-4000-8000-000000000112", false)
+        .unwrap();
+    assert!(database.pending_outbox().unwrap().is_empty());
+}
+
+#[test]
+fn epoch_adoption_keeps_only_unreceipted_consented_mutations_and_drops_new_cloud_edits() {
+    let directory = tempdir().unwrap();
+    let database = Database::open(directory.path().join("partial-consent.sqlite3")).unwrap();
+    for id in ["consented-one", "consented-two"] {
+        database
+            .save_profile(&Profile {
+                id: id.into(),
+                name: id.into(),
+                source_path: format!("/{id}/source"),
+                target_path: format!("/{id}/target"),
+                exclusions: vec![],
+                created_at: "2026-08-15T00:00:00Z".into(),
+                updated_at: "2026-08-15T00:00:00Z".into(),
+            })
+            .unwrap();
+    }
+    database.claim_hosted_account("alice", true).unwrap();
+    database
+        .accept_account_epoch("alice", "00000000-0000-4000-8000-000000000121", false)
+        .unwrap();
+    let request = database.hosted_sync_request("alice").unwrap();
+    let epoch = request["epoch"].as_str().unwrap().to_owned();
+    let generation = database
+        .hosted_sync_generation("alice", &epoch, "")
+        .unwrap();
+    database
+        .apply_hosted_sync_response(
+            "alice",
+            &epoch,
+            "",
+            generation,
+            &serde_json::json!({
+                "epoch": epoch, "cursor": "partial", "hasMore": false, "records": [],
+                "receipts": [{ "mutationId": request["mutations"][0]["mutationId"], "revision": 1 }]
+            }),
+        )
+        .unwrap();
+    assert_eq!(database.pending_outbox().unwrap().len(), 1);
+    database
+        .save_profile(&Profile {
+            id: "cloud-owned-new-edit".into(),
+            name: "Cloud-owned new edit".into(),
+            source_path: "/cloud/source".into(),
+            target_path: "/cloud/target".into(),
+            exclusions: vec![],
+            created_at: "2026-08-15T00:01:00Z".into(),
+            updated_at: "2026-08-15T00:01:00Z".into(),
+        })
+        .unwrap();
+    assert_eq!(database.pending_outbox().unwrap().len(), 2);
+    database
+        .accept_account_epoch("alice", "00000000-0000-4000-8000-000000000122", false)
+        .unwrap();
+    let preserved = database.pending_outbox().unwrap();
+    assert_eq!(preserved.len(), 1);
+    assert!(preserved[0].payload.contains("consented-two"));
+    assert!(!preserved[0].payload.contains("cloud-owned-new-edit"));
+}
+
+#[test]
+fn editing_a_consented_profile_before_epoch_adoption_preserves_the_newer_edit() {
+    let directory = tempdir().unwrap();
+    let database = Database::open(directory.path().join("consented-edit.sqlite3")).unwrap();
+    let mut profile = Profile {
+        id: "consented-profile".into(),
+        name: "Old value".into(),
+        source_path: "/old/source".into(),
+        target_path: "/old/target".into(),
+        exclusions: vec![],
+        created_at: "2026-08-15T00:00:00Z".into(),
+        updated_at: "2026-08-15T00:00:00Z".into(),
+    };
+    database.save_profile(&profile).unwrap();
+    database.claim_hosted_account("alice", true).unwrap();
+    profile.name = "New value".into();
+    profile.updated_at = "2026-08-15T00:01:00Z".into();
+    database.save_profile(&profile).unwrap();
+
+    database
+        .accept_account_epoch("alice", "00000000-0000-4000-8000-000000000131", false)
+        .unwrap();
+    let request = database.hosted_sync_request("alice").unwrap();
+    assert_eq!(request["mutations"].as_array().unwrap().len(), 2);
+    assert_eq!(request["mutations"][1]["profile"]["name"], "New value");
+    let epoch = request["epoch"].as_str().unwrap();
+    let generation = database.hosted_sync_generation("alice", epoch, "").unwrap();
+    database
+        .apply_hosted_sync_response(
+            "alice",
+            epoch,
+            "",
+            generation,
+            &serde_json::json!({
+                "epoch": epoch,
+                "cursor": "edited",
+                "hasMore": false,
+                "records": [{ "kind": "profile", "revision": 2, "profile": profile }],
+                "receipts": request["mutations"].as_array().unwrap().iter().enumerate().map(|(index, mutation)| {
+                    serde_json::json!({ "mutationId": mutation["mutationId"], "revision": index + 1 })
+                }).collect::<Vec<_>>()
+            }),
+        )
+        .unwrap();
+    assert_eq!(database.list_profiles().unwrap()[0].name, "New value");
+    assert!(database.pending_outbox().unwrap().is_empty());
+}
+
+#[test]
+fn deleting_a_consented_profile_before_epoch_adoption_preserves_the_tombstone() {
+    let directory = tempdir().unwrap();
+    let database = Database::open(directory.path().join("consented-delete.sqlite3")).unwrap();
+    let profile = Profile {
+        id: "consented-profile".into(),
+        name: "Delete me".into(),
+        source_path: "/delete/source".into(),
+        target_path: "/delete/target".into(),
+        exclusions: vec![],
+        created_at: "2026-08-15T00:00:00Z".into(),
+        updated_at: "2026-08-15T00:00:00Z".into(),
+    };
+    database.save_profile(&profile).unwrap();
+    database.claim_hosted_account("alice", true).unwrap();
+    database.delete_profile(&profile.id).unwrap();
+
+    database
+        .accept_account_epoch("alice", "00000000-0000-4000-8000-000000000132", false)
+        .unwrap();
+    let request = database.hosted_sync_request("alice").unwrap();
+    assert_eq!(request["mutations"].as_array().unwrap().len(), 2);
+    assert_eq!(request["mutations"][1]["kind"], "delete");
+    assert_eq!(request["mutations"][1]["profileId"], profile.id);
+    assert!(database.list_profiles().unwrap().is_empty());
+    let epoch = request["epoch"].as_str().unwrap();
+    let generation = database.hosted_sync_generation("alice", epoch, "").unwrap();
+    database
+        .apply_hosted_sync_response(
+            "alice",
+            epoch,
+            "",
+            generation,
+            &serde_json::json!({
+                "epoch": epoch,
+                "cursor": "deleted",
+                "hasMore": false,
+                "records": [{ "kind": "tombstone", "revision": 2, "profileId": profile.id }],
+                "receipts": request["mutations"].as_array().unwrap().iter().enumerate().map(|(index, mutation)| {
+                    serde_json::json!({ "mutationId": mutation["mutationId"], "revision": index + 1 })
+                }).collect::<Vec<_>>()
+            }),
+        )
+        .unwrap();
+    assert!(database.list_profiles().unwrap().is_empty());
+    assert!(database.pending_outbox().unwrap().is_empty());
 }
 
 #[test]
