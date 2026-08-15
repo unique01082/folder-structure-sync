@@ -191,6 +191,22 @@ pub enum DirectoryStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiffStatus {
+    Missing,
+    Exists,
+    Excluded,
+    Unreadable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffEntry {
+    pub relative_path: String,
+    pub status: DiffStatus,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectoryResult {
@@ -211,6 +227,7 @@ pub struct ScanPlan {
     pub target_case_sensitive: bool,
     pub plan_fingerprint: String,
     pub missing: Vec<String>,
+    pub diff_entries: Vec<DiffEntry>,
     pub skipped_links: Vec<String>,
 }
 
@@ -229,6 +246,8 @@ struct Snapshot {
     entries: Vec<String>,
     fingerprint: String,
     skipped_links: Vec<String>,
+    excluded: Vec<String>,
+    unreadable: Vec<String>,
 }
 
 fn absolute(path: &Path) -> Result<PathBuf, NativeError> {
@@ -547,21 +566,44 @@ fn normalize_relative(path: &Path) -> String {
 fn glob_segment_matches(value: &str, pattern: &str) -> bool {
     let value: Vec<_> = value.chars().collect();
     let pattern: Vec<_> = pattern.chars().collect();
-    let mut matches = vec![false; value.len() + 1];
-    matches[0] = true;
-    for token in pattern {
-        if token == '*' {
-            for index in 1..=value.len() {
-                matches[index] = matches[index] || matches[index - 1];
-            }
-        } else {
-            for index in (1..=value.len()).rev() {
-                matches[index] = matches[index - 1] && value[index - 1] == token;
-            }
-            matches[0] = false;
+    fn visit(
+        value: &[char],
+        pattern: &[char],
+        value_index: usize,
+        pattern_index: usize,
+        memo: &mut HashMap<(usize, usize), bool>,
+    ) -> bool {
+        if let Some(result) = memo.get(&(value_index, pattern_index)) {
+            return *result;
         }
+        let result = if pattern_index == pattern.len() {
+            value_index == value.len()
+        } else if pattern[pattern_index] == '*' && pattern.get(pattern_index + 1) == Some(&'*') {
+            let after_globstar = pattern_index + 2;
+            let skips_empty_segment = pattern.get(after_globstar) == Some(&'/')
+                && visit(value, pattern, value_index, after_globstar + 1, memo);
+            skips_empty_segment
+                || visit(value, pattern, value_index, after_globstar, memo)
+                || (value_index < value.len()
+                    && visit(value, pattern, value_index + 1, pattern_index, memo))
+        } else if pattern[pattern_index] == '*' {
+            visit(value, pattern, value_index, pattern_index + 1, memo)
+                || (value_index < value.len()
+                    && value[value_index] != '/'
+                    && visit(value, pattern, value_index + 1, pattern_index, memo))
+        } else if pattern[pattern_index] == '?' {
+            value_index < value.len()
+                && value[value_index] != '/'
+                && visit(value, pattern, value_index + 1, pattern_index + 1, memo)
+        } else {
+            value_index < value.len()
+                && value[value_index] == pattern[pattern_index]
+                && visit(value, pattern, value_index + 1, pattern_index + 1, memo)
+        };
+        memo.insert((value_index, pattern_index), result);
+        result
     }
-    matches[value.len()]
+    visit(&value, &pattern, 0, 0, &mut HashMap::new())
 }
 
 fn excluded(relative: &str, patterns: &[String]) -> bool {
@@ -597,20 +639,30 @@ fn scan_root(
 ) -> Result<Snapshot, NativeError> {
     let mut entries = Vec::new();
     let mut skipped_links = Vec::new();
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(current) = pending.pop() {
+    let mut excluded_entries = Vec::new();
+    let mut unreadable = Vec::new();
+    let mut pending = vec![(root.to_path_buf(), String::new())];
+    while let Some((current, current_relative)) = pending.pop() {
         token.check()?;
         if current.join(".ignore").exists() {
             continue;
         }
-        let mut children = fs::read_dir(&current)
-            .map_err(|error| {
-                NativeError::at(NativeErrorCode::UnreadablePath, error.to_string(), &current)
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                NativeError::at(NativeErrorCode::UnreadablePath, error.to_string(), &current)
-            })?;
+        let mut children = match fs::read_dir(&current)
+            .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
+        {
+            Ok(children) => children,
+            Err(_error) if !current_relative.is_empty() => {
+                unreadable.push(current_relative);
+                continue;
+            }
+            Err(error) => {
+                return Err(NativeError::at(
+                    NativeErrorCode::UnreadablePath,
+                    error.to_string(),
+                    &current,
+                ));
+            }
+        };
         children.sort_by_key(|entry| entry.file_name());
         for child in children.into_iter().rev() {
             token.check()?;
@@ -618,27 +670,57 @@ fn scan_root(
             let relative =
                 normalize_relative(path.strip_prefix(root).expect("entry is below root"));
             if excluded(&relative, exclusions) {
+                excluded_entries.push(relative);
                 continue;
             }
-            let metadata = fs::symlink_metadata(&path).map_err(|error| {
-                NativeError::at(NativeErrorCode::UnreadablePath, error.to_string(), &path)
-            })?;
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    unreadable.push(relative);
+                    continue;
+                }
+            };
             if is_link_or_junction(&metadata) {
                 skipped_links.push(relative);
             } else if metadata.is_dir() {
-                entries.push(relative);
-                pending.push(path);
+                entries.push(relative.clone());
+                pending.push((path, relative));
             }
         }
     }
     entries.sort();
     skipped_links.sort();
-    let fingerprint = fingerprint(&entries);
+    excluded_entries.sort();
+    unreadable.sort();
+    let mut fingerprint_values = entries.clone();
+    fingerprint_values.extend(
+        excluded_entries
+            .iter()
+            .map(|path| format!("excluded:{path}")),
+    );
+    fingerprint_values.extend(unreadable.iter().map(|path| format!("unreadable:{path}")));
+    fingerprint_values.extend(skipped_links.iter().map(|path| format!("linked:{path}")));
+    let fingerprint = fingerprint(&fingerprint_values);
     Ok(Snapshot {
         entries,
         fingerprint,
         skipped_links,
+        excluded: excluded_entries,
+        unreadable,
     })
+}
+
+fn contains_path_or_ancestor(paths: &HashSet<String>, relative: &str) -> bool {
+    let mut current = relative;
+    loop {
+        if paths.contains(current) {
+            return true;
+        }
+        let Some(separator) = current.rfind('/') else {
+            return false;
+        };
+        current = &current[..separator];
+    }
 }
 
 pub fn scan_plan(
@@ -664,11 +746,44 @@ pub fn scan_plan(
         .iter()
         .map(|entry| comparable(entry))
         .collect();
-    let missing: Vec<_> = source_snapshot
-        .entries
+    let source_unreadable: HashSet<_> = source_snapshot.unreadable.iter().cloned().collect();
+    let target_unreadable: HashSet<_> = target_snapshot
+        .unreadable
         .iter()
-        .filter(|entry| !target_entries.contains(&comparable(entry)))
-        .cloned()
+        .map(|entry| comparable(entry))
+        .collect();
+    let mut statuses = HashMap::new();
+    for entry in &source_snapshot.entries {
+        let comparable_entry = comparable(entry);
+        let status = if contains_path_or_ancestor(&source_unreadable, entry)
+            || contains_path_or_ancestor(&target_unreadable, &comparable_entry)
+        {
+            DiffStatus::Unreadable
+        } else if target_entries.contains(&comparable_entry) {
+            DiffStatus::Exists
+        } else {
+            DiffStatus::Missing
+        };
+        statuses.insert(entry.clone(), status);
+    }
+    for entry in &source_snapshot.excluded {
+        statuses.insert(entry.clone(), DiffStatus::Excluded);
+    }
+    for entry in &source_snapshot.unreadable {
+        statuses.insert(entry.clone(), DiffStatus::Unreadable);
+    }
+    let mut diff_entries: Vec<_> = statuses
+        .into_iter()
+        .map(|(relative_path, status)| DiffEntry {
+            relative_path,
+            status,
+        })
+        .collect();
+    diff_entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    let missing: Vec<_> = diff_entries
+        .iter()
+        .filter(|entry| entry.status == DiffStatus::Missing)
+        .map(|entry| entry.relative_path.clone())
         .collect();
     let mut plan_values = vec![
         source.to_string_lossy().into_owned(),
@@ -681,7 +796,11 @@ pub fn scan_plan(
             "case-insensitive".into()
         },
     ];
-    plan_values.extend(missing.iter().cloned());
+    plan_values.extend(
+        diff_entries
+            .iter()
+            .map(|entry| format!("{:?}:{}", entry.status, entry.relative_path)),
+    );
     Ok(ScanPlan {
         operation_id: request.operation_id.clone(),
         source_root: source,
@@ -691,6 +810,7 @@ pub fn scan_plan(
         target_case_sensitive,
         plan_fingerprint: fingerprint(&plan_values),
         missing,
+        diff_entries,
         skipped_links: source_snapshot.skipped_links,
     })
 }
@@ -750,6 +870,7 @@ fn apply_plan_with_observer(
         || current.target_fingerprint != plan.target_fingerprint
         || current.plan_fingerprint != plan.plan_fingerprint
         || current.missing != plan.missing
+        || current.diff_entries != plan.diff_entries
     {
         return Err(NativeError::new(
             NativeErrorCode::StalePlan,

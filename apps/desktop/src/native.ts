@@ -26,7 +26,15 @@ export interface ScanPlan {
   targetCaseSensitive: boolean;
   planFingerprint: string;
   missing: string[];
+  diffEntries: DiffEntry[];
   skippedLinks: string[];
+}
+
+export type DiffStatus = "missing" | "exists" | "excluded" | "unreadable";
+
+export interface DiffEntry {
+  relativePath: string;
+  status: DiffStatus;
 }
 
 export type DirectoryStatus = "created" | "already-exists" | "failed";

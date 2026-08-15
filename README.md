@@ -36,7 +36,7 @@ folder-sync <source> <target> [options]
 --json          Emit one JSON document and never prompt
 ```
 
-`--json` is intended for automation. Exit code `0` means success or a deliberate no-op, `1` means a filesystem/configuration/apply failure, and `2` means invalid command usage.
+`--json` is intended for automation and must be paired with `--dry-run` or `--auto`; it never prompts or emits progress/color output. Exit code `0` means success or a deliberate no-op, `1` means a filesystem/configuration/apply failure, and `2` means invalid command usage.
 
 ## Documentation
 

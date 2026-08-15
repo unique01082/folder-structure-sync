@@ -94,6 +94,20 @@ describe("Node filesystem adapter", () => {
     });
   });
 
+  it("detects the target filesystem case policy without mutating the scanned directory", async () => {
+    const root = await tempDirectory();
+    const sentinel = join(root, "CasePolicySentinel");
+    await writeFile(sentinel, "unchanged");
+    const before = await readFile(sentinel, "utf8");
+    const adapter = new NodeFileSystemAdapter();
+
+    const detected = await adapter.detectCaseSensitivity(root);
+    const actual = !(await lstat(join(root, "casepolicysentinel")).then(() => true, () => false));
+
+    expect(detected).toBe(actual);
+    expect(await readFile(sentinel, "utf8")).toBe(before);
+  });
+
   it("revalidates stale plans before mkdir and reports per-directory results", async () => {
     const target = await tempDirectory();
     const sourceRoot = await tempDirectory();

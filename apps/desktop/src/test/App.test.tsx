@@ -17,6 +17,15 @@ const plan: ScanPlan = {
   targetCaseSensitive: false,
   planFingerprint: "plan-fp",
   missing: ["docs", "docs/api", "src", "src/components"],
+  diffEntries: [
+    { relativePath: "docs", status: "missing" },
+    { relativePath: "docs/api", status: "missing" },
+    { relativePath: "existing", status: "exists" },
+    { relativePath: "private", status: "excluded" },
+    { relativePath: "locked", status: "unreadable" },
+    { relativePath: "src", status: "missing" },
+    { relativePath: "src/components", status: "missing" },
+  ],
   skippedLinks: [],
 };
 
@@ -188,7 +197,11 @@ describe("Rootline desktop workflow", () => {
     }} />);
     await user.click(screen.getByRole("button", { name: "Scan differences" }));
     await screen.findByRole("heading", { name: "Review 4 missing folders" });
-    expect(screen.getByRole("tree", { name: "Missing folders" })).toHaveAttribute("aria-multiselectable", "true");
+    expect(screen.getByRole("tree", { name: "Folder differences" })).toHaveAttribute("aria-multiselectable", "true");
+    expect(screen.getByRole("treeitem", { name: "existing" })).toHaveTextContent("Exists");
+    expect(screen.getByRole("treeitem", { name: "private" })).toHaveTextContent("Excluded");
+    expect(screen.getByRole("treeitem", { name: "locked" })).toHaveTextContent("Unreadable");
+    expect(screen.getByRole("button", { name: "Select all missing" })).toBeInTheDocument();
     const results = await axe.run(container);
     expect(results.violations).toEqual([]);
   });
@@ -321,23 +334,24 @@ describe("Rootline desktop workflow", () => {
 describe("DiffTree virtualization", () => {
   test("renders a bounded window for a 50,000-folder fixture and keeps subtree selection", async () => {
     const user = userEvent.setup();
-    const entries = Array.from({ length: 50_000 }, (_, index) => `root/group-${Math.floor(index / 100)}/folder-${index}`);
+    const paths = Array.from({ length: 50_000 }, (_, index) => `root/group-${Math.floor(index / 100)}/folder-${index}`);
+    const entries = paths.map((relativePath) => ({ relativePath, status: "missing" as const }));
     const onSelectionChange = vi.fn();
     const { container } = render(
-      <DiffTree entries={entries} selected={new Set(entries)} onSelectionChange={onSelectionChange} />,
+      <DiffTree entries={entries} selected={new Set(paths)} onSelectionChange={onSelectionChange} />,
     );
 
     expect(screen.getByRole("tree")).not.toHaveAttribute("aria-rowcount");
     expect(container.querySelectorAll('[role="treeitem"]').length).toBeLessThan(80);
     await user.type(screen.getByRole("searchbox", { name: "Search folders" }), "folder-49999");
-    expect(await screen.findByRole("treeitem", { name: entries[49_999]! })).toBeInTheDocument();
+    expect(await screen.findByRole("treeitem", { name: paths[49_999]! })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Clear selection" }));
     expect(onSelectionChange).toHaveBeenLastCalledWith(new Set());
   });
 
   test("uses named treeitems with roving keyboard navigation and parent dependency selection", async () => {
     const user = userEvent.setup();
-    const entries = ["docs", "docs/api", "docs/api/v2", "src"];
+    const entries = ["docs", "docs/api", "docs/api/v2", "src"].map((relativePath) => ({ relativePath, status: "missing" as const }));
     const onSelectionChange = vi.fn();
     const view = render(<DiffTree entries={entries} selected={new Set()} onSelectionChange={onSelectionChange} />);
     const docs = screen.getByRole("treeitem", { name: "docs" });

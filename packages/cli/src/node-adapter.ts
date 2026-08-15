@@ -1,5 +1,7 @@
 import { promises as fs } from "node:fs";
+import { execFile as execFileCallback } from "node:child_process";
 import { basename, dirname, join, resolve } from "node:path";
+import { promisify } from "node:util";
 
 import {
   ROOTLINE_ERROR_CODES,
@@ -39,10 +41,12 @@ export const DEFAULT_EXCLUSIONS = [
   ".nyc_output",
 ] as const;
 
+const execFile = promisify(execFileCallback);
+
 export interface ResolvedConfig {
   readonly path?: string;
   readonly exclusions: readonly string[];
-  readonly targetCaseSensitive: boolean;
+  readonly targetCaseSensitive?: boolean;
 }
 
 export interface ResolveConfigOptions {
@@ -83,7 +87,7 @@ export async function resolveConfig(options: ResolveConfigOptions): Promise<Reso
     raw = await fs.readFile(candidate, "utf8");
   } catch (error: unknown) {
     if (!options.explicitPath && isMissing(error)) {
-      return { exclusions: DEFAULT_EXCLUSIONS, targetCaseSensitive: defaultCaseSensitivity() };
+      return { exclusions: DEFAULT_EXCLUSIONS };
     }
     return configError("Unable to read the configuration file.", candidate, error);
   }
@@ -107,12 +111,8 @@ export async function resolveConfig(options: ResolveConfigOptions): Promise<Reso
   return {
     path: candidate,
     exclusions: [...defaults, ...custom],
-    targetCaseSensitive: parsed.targetCaseSensitive ?? defaultCaseSensitivity(),
+    ...(parsed.targetCaseSensitive === undefined ? {} : { targetCaseSensitive: parsed.targetCaseSensitive }),
   };
-}
-
-function defaultCaseSensitivity(): boolean {
-  return process.platform !== "win32" && process.platform !== "darwin";
 }
 
 function isMissing(error: unknown): boolean {
@@ -221,7 +221,37 @@ export class NodeFileSystemAdapter {
     };
 
     await visit(canonicalRoot, "");
-    return { snapshot: createSnapshot(entries), skippedSymlinks: Object.freeze(skippedSymlinks) };
+    const caseSensitive = await this.detectCaseSensitivity(canonicalRoot);
+    return {
+      snapshot: createSnapshot(entries, {
+        rootPath: canonicalRoot,
+        caseSensitivity: caseSensitive ? "sensitive" : "insensitive",
+        skippedLinks: skippedSymlinks,
+      }),
+      skippedSymlinks: Object.freeze(skippedSymlinks),
+    };
+  }
+
+  async detectCaseSensitivity(path: string): Promise<boolean> {
+    const ancestor = await this.nearestExistingAncestor(path);
+    if (process.platform === "darwin") {
+      try {
+        const { stdout } = await execFile("diskutil", ["info", ancestor], { encoding: "utf8" });
+        const personality = stdout.split("\n").find((line) => line.includes("File System Personality:"));
+        return personality?.toLocaleLowerCase().includes("case-sensitive") ?? false;
+      } catch {
+        return false;
+      }
+    }
+    if (process.platform === "win32") {
+      try {
+        const { stdout } = await execFile("fsutil.exe", ["file", "queryCaseSensitiveInfo", ancestor], { encoding: "utf8" });
+        return /enabled/i.test(stdout);
+      } catch {
+        return false;
+      }
+    }
+    return true;
   }
 
   async ensureTarget(targetPath: string, dryRun = false): Promise<"created" | "already-exists" | "would-create"> {
@@ -265,6 +295,13 @@ export class NodeFileSystemAdapter {
       this.scanDirectories(canonicalSource, options.exclusions, "source", options.signal),
       this.scanDirectories(canonicalTarget, options.exclusions, "target", options.signal),
     ]);
+    if ((plan.sourceRoot && plan.sourceRoot !== currentSource.snapshot.rootPath)
+      || (plan.targetRoot && plan.targetRoot !== currentTarget.snapshot.rootPath)) {
+      throw createRootlineError({
+        code: ROOTLINE_ERROR_CODES.STALE_PLAN,
+        message: "The selected roots differ from the reviewed plan.",
+      });
+    }
     assertPlanFresh(plan, currentSource.snapshot, currentTarget.snapshot);
     const selected = options.selected ?? plan.missing;
     const directories = selectPlanSubtree(plan, selected);
@@ -323,6 +360,21 @@ export class NodeFileSystemAdapter {
         missing.unshift(basename(current));
         current = parent;
       }
+    }
+  }
+
+  private async nearestExistingAncestor(path: string): Promise<string> {
+    let current = resolve(path);
+    while (true) {
+      try {
+        await fs.lstat(current);
+        return current;
+      } catch (error: unknown) {
+        if (!isMissing(error)) throw unreadable(current, error);
+      }
+      const parent = dirname(current);
+      if (parent === current) throw unreadable(path);
+      current = parent;
     }
   }
 

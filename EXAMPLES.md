@@ -24,7 +24,7 @@ Without `--auto`, Rootline asks for confirmation in an interactive terminal. Roo
 folder-sync ./source ./target --auto --json
 ```
 
-`--json` emits one JSON document and never prompts. Combine it with `--auto` to apply a plan in automation. Exit code `0` means success or a deliberate no-op, `1` means an operational failure, and `2` means invalid usage.
+`--json` emits one JSON document, never prompts, and is accepted only with `--dry-run` or `--auto`. Combine it with `--auto` to apply a plan in automation. Exit code `0` means success or a deliberate no-op, `1` means an operational failure, and `2` means invalid usage.
 
 ## Explicit configuration
 

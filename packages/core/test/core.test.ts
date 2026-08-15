@@ -23,6 +23,11 @@ describe("Rootline synchronization core", () => {
     expect(matchesExclusion(".github/workflows", [".git"])).toBe(false);
     expect(matchesExclusion("build/cache", ["build"])).toBe(true);
     expect(matchesExclusion("notes/error.log", ["*.log"])).toBe(true);
+    expect(matchesExclusion("notes/app1.log", ["app?.log"])).toBe(true);
+    expect(matchesExclusion("notes/app10.log", ["app?.log"])).toBe(false);
+    expect(matchesExclusion("generated/deep/cache", ["generated/**/cache"])).toBe(true);
+    expect(matchesExclusion("generated/cache", ["generated/**/cache"])).toBe(true);
+    expect(matchesExclusion("generated/deep/nested/cache", ["generated/*/cache"])).toBe(false);
   });
 
   it("creates deterministic snapshots and dependency-complete subtree selections", () => {
@@ -39,6 +44,34 @@ describe("Rootline synchronization core", () => {
     ]);
     expect(createSnapshot([...source.entries].reverse()).fingerprint).toBe(source.fingerprint);
     expect(createSnapshot(["z", "ä", "a"]).entries).toEqual(["a", "z", "ä"]);
+  });
+
+  it("exports immutable public snapshot and operation-plan fields", () => {
+    const source = createSnapshot(["docs/api", "docs"], {
+      rootPath: "/source",
+      caseSensitivity: "sensitive",
+      skippedLinks: ["linked"],
+    });
+    const target = createSnapshot(["docs"], {
+      rootPath: "/target",
+      caseSensitivity: "insensitive",
+    });
+    const plan = createSyncPlan(source, target, false);
+
+    expect(source).toMatchObject({
+      rootPath: "/source",
+      caseSensitivity: "sensitive",
+      directories: ["docs", "docs/api"],
+      skippedLinks: ["linked"],
+    });
+    expect(plan).toMatchObject({ sourceRoot: "/source", targetRoot: "/target" });
+    expect(plan.operations).toEqual([
+      expect.objectContaining({ type: "create-directory", relativePath: "docs/api" }),
+    ]);
+    expect(plan.operations[0]?.id).toBe(createSyncPlan(source, target, false).operations[0]?.id);
+    expect(createSyncPlan(source, createSnapshot(["docs"], { rootPath: "/other-target" }), false).fingerprint)
+      .not.toBe(plan.fingerprint);
+    expect(Object.isFrozen(plan.operations)).toBe(true);
   });
 
   it("rejects equal or overlapping synchronization roots", () => {

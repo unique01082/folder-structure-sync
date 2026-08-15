@@ -1,22 +1,23 @@
 import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 
 import { copy } from "../i18n";
+import type { DiffEntry, DiffStatus } from "../native";
 
 export interface DiffTreeLabels {
   search: string;
   all: string;
   selected: string;
   clear: string;
-  selectAll: string;
+  selectAllMissing: string;
   folderDifferences: string;
   folderFilter: string;
-  missingFolders: string;
+  status: Record<DiffStatus, string>;
   visibleCount: (count: number) => string;
   selectedCount: (count: number) => string;
 }
 
 interface DiffTreeProps {
-  entries: readonly string[];
+  entries: readonly DiffEntry[];
   selected: ReadonlySet<string>;
   onSelectionChange: (selection: Set<string>) => void;
   labels?: DiffTreeLabels;
@@ -67,22 +68,25 @@ function closeOverParents(entries: readonly string[], candidates: ReadonlySet<st
 }
 
 export const DiffTree = memo(function DiffTree({ entries, selected, onSelectionChange, labels = copy.en.tree }: DiffTreeProps) {
+  const paths = useMemo(() => entries.map((entry) => entry.relativePath), [entries]);
+  const entryByPath = useMemo(() => new Map(entries.map((entry) => [entry.relativePath, entry])), [entries]);
+  const missingPaths = useMemo(() => entries.filter((entry) => entry.status === "missing").map((entry) => entry.relativePath), [entries]);
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query.trim().toLocaleLowerCase());
   const [filter, setFilter] = useState<"all" | "selected">("all");
-  const parents = useMemo(() => parentPaths(entries), [entries]);
+  const parents = useMemo(() => parentPaths(paths), [paths]);
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set(parents));
   const [scrollTop, setScrollTop] = useState(0);
-  const [activeEntry, setActiveEntry] = useState(entries[0] ?? "");
+  const [activeEntry, setActiveEntry] = useState(paths[0] ?? "");
   const viewport = useRef<HTMLDivElement>(null);
   const itemRefs = useRef(new Map<string, HTMLDivElement>());
   const shouldFocusActive = useRef(false);
 
-  const visible = useMemo(() => entries.filter((entry) => {
+  const visible = useMemo(() => paths.filter((entry) => {
     if (filter === "selected" && !selected.has(entry)) return false;
     if (deferredQuery && !entry.toLocaleLowerCase().includes(deferredQuery)) return false;
     return visibleUnderExpansion(entry, expanded, parents);
-  }), [deferredQuery, entries, expanded, filter, parents, selected]);
+  }), [deferredQuery, expanded, filter, parents, paths, selected]);
 
   useEffect(() => {
     if (!visible.includes(activeEntry)) setActiveEntry(visible[0] ?? "");
@@ -112,14 +116,15 @@ export const DiffTree = memo(function DiffTree({ entries, selected, onSelectionC
   };
 
   const toggleSelection = (entry: string): void => {
-    const descendants = entries.filter((candidate) => candidate === entry || candidate.startsWith(`${entry}/`));
+    if (entryByPath.get(entry)?.status !== "missing") return;
+    const descendants = missingPaths.filter((candidate) => candidate === entry || candidate.startsWith(`${entry}/`));
     const next = new Set(selected);
     const shouldSelect = descendants.some((candidate) => !next.has(candidate));
     for (const descendant of descendants) {
       if (shouldSelect) next.add(descendant);
       else next.delete(descendant);
     }
-    onSelectionChange(closeOverParents(entries, next));
+    onSelectionChange(closeOverParents(missingPaths, next));
   };
 
   const toggleExpanded = (entry: string, force?: boolean): void => {
@@ -171,19 +176,21 @@ export const DiffTree = memo(function DiffTree({ entries, selected, onSelectionC
           <button type="button" aria-pressed={filter === "selected"} onClick={() => setFilter("selected")}>{labels.selected}</button>
         </div>
         <button className="quiet-button" type="button" onClick={() => onSelectionChange(new Set())}>{labels.clear}</button>
-        <button className="quiet-button" type="button" onClick={() => onSelectionChange(new Set(entries))}>{labels.selectAll}</button>
+        <button className="quiet-button" type="button" onClick={() => onSelectionChange(new Set(missingPaths))}>{labels.selectAllMissing}</button>
       </div>
       <div className="tree-summary" aria-live="polite">
         <span>{labels.visibleCount(visible.length)}</span>
         <span>{labels.selectedCount(selected.size)}</span>
       </div>
-      <div ref={viewport} className="tree-viewport" role="tree" aria-label={labels.missingFolders} aria-multiselectable="true" onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}>
+      <div ref={viewport} className="tree-viewport" role="tree" aria-label={labels.folderDifferences} aria-multiselectable="true" onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}>
         <div className="tree-spacer" role="presentation" style={{ height: `${visible.length * ROW_HEIGHT}px` }}>
           {windowed.map((entry, offset) => {
             const index = start + offset;
             const isParent = parents.has(entry);
             const isExpanded = expanded.has(entry);
             const isSelected = selected.has(entry);
+            const diff = entryByPath.get(entry)!;
+            const statusId = `diff-status-${index}`;
             return (
               <div
                 ref={(node) => { if (node) itemRefs.current.set(entry, node); else itemRefs.current.delete(entry); }}
@@ -191,19 +198,21 @@ export const DiffTree = memo(function DiffTree({ entries, selected, onSelectionC
                 role="treeitem"
                 aria-label={entry}
                 aria-level={depthOf(entry)}
-                aria-selected={isSelected}
+                aria-selected={diff.status === "missing" ? isSelected : undefined}
                 aria-expanded={isParent ? isExpanded : undefined}
+                aria-describedby={statusId}
                 tabIndex={activeEntry === entry ? 0 : -1}
                 key={entry}
-                onClick={() => { setActiveEntry(entry); toggleSelection(entry); }}
+                onClick={() => { setActiveEntry(entry); if (diff.status === "missing") toggleSelection(entry); else if (isParent) toggleExpanded(entry); }}
                 onFocus={() => setActiveEntry(entry)}
                 onKeyDown={(event) => onTreeKeyDown(event, entry)}
                 style={{ top: `${index * ROW_HEIGHT}px`, paddingInlineStart: `${14 + (depthOf(entry) - 1) * 22}px` }}
               >
                 <span className={isParent ? "disclosure" : "branch"} aria-hidden="true" onClick={isParent ? (event) => { event.stopPropagation(); toggleExpanded(entry); } : undefined}>{isParent ? (isExpanded ? "−" : "+") : null}</span>
-                <span className="selection-box" aria-hidden="true">{isSelected ? "✓" : ""}</span>
+                {diff.status === "missing" ? <span className="selection-box" aria-hidden="true">{isSelected ? "✓" : ""}</span> : <span className="status-spacer" aria-hidden="true" />}
                 <span className="folder-glyph" aria-hidden="true" />
                 <span className="path-label">{entry}</span>
+                <span id={statusId} className={`diff-status status-${diff.status}`}>{labels.status[diff.status]}</span>
               </div>
             );
           })}

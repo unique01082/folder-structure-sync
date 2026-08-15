@@ -53,7 +53,7 @@ describe("folder-sync command", () => {
     expect(JSON.parse(result.stdout)).toMatchObject({ target: { status: "created" } });
   });
 
-  it("keeps a missing target untouched in JSON mode without --auto", async () => {
+  it("rejects JSON mode unless it is explicitly dry-run or auto", async () => {
     const workspace = await tempDirectory();
     const source = join(workspace, "source");
     const target = join(workspace, "target");
@@ -61,10 +61,9 @@ describe("folder-sync command", () => {
 
     const result = run(source, target, "--json");
 
-    expect(result.status).toBe(0);
+    expect(result.status).toBe(2);
     expect(JSON.parse(result.stdout)).toMatchObject({
-      target: { status: "would-create" },
-      plan: { missing: ["src"] },
+      error: { code: "CONFIG_INVALID" },
     });
     await expect(lstat(target)).rejects.toMatchObject({ code: "ENOENT" });
   });

@@ -9,6 +9,6 @@ folder-sync ./source ./target --dry-run
 folder-sync ./source ./target --auto --json
 ```
 
-Use `--dry-run` to preview. `--json` never prompts; combine it with `--auto` for non-interactive application. Run `folder-sync --help` for the complete command reference.
+Use `--dry-run` to preview. `--json` never prompts and is accepted only with `--dry-run` or `--auto`; use the latter for non-interactive application. Run `folder-sync --help` for the complete command reference.
 
 Documentation, source, security policy, and release status: <https://github.com/unique01082/folder-structure-sync>

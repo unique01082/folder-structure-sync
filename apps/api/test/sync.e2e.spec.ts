@@ -130,6 +130,66 @@ describe("Rootline hosted sync (real PostgreSQL)", () => {
     expect(isolated.body.records).toEqual([]);
   });
 
+  test("accepts and returns the documented public v1 sync contract alongside the paginated protocol", async () => {
+    const auth = await token("public-contract-user");
+    const mutationId = "00000000-0000-4000-8000-000000000205";
+    const profile = {
+      id: "public-profile",
+      schemaVersion: 1,
+      name: "Public profile",
+      sourcePath: "/Users/public/source",
+      targetPath: "D:\\public-target",
+      exclusions: ["generated/**/cache"],
+      revision: "0",
+      deletedAt: null,
+    };
+    const created = await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${auth}`)
+      .send({
+        deviceId: "public-device",
+        accountEpoch: null,
+        cursor: "",
+        mutations: [{ mutationId, type: "upsert", profile }],
+      }).expect(200);
+
+    expect(created.body).toMatchObject({
+      accountEpoch: expect.any(String),
+      acknowledgedMutationIds: [mutationId],
+      profiles: [{ ...profile, revision: "1" }],
+    });
+    expect(created.body).toMatchObject({ epoch: created.body.accountEpoch, receipts: [{ mutationId }] });
+    await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${auth}`)
+      .send({
+        deviceId: "public-device",
+        accountEpoch: created.body.accountEpoch,
+        cursor: created.body.cursor,
+        mutations: [{ mutationId, type: "upsert", profile: { ...profile, revision: "different-payload" } }],
+      }).expect(409);
+    await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${auth}`)
+      .send({
+        deviceId: "public-device",
+        accountEpoch: created.body.accountEpoch,
+        cursor: created.body.cursor,
+        mutations: [{
+          mutationId: "00000000-0000-4000-8000-000000000207",
+          type: "upsert",
+          profile: { ...profile, syncMode: "additive" },
+        }],
+      }).expect(400);
+
+    const deleteMutationId = "00000000-0000-4000-8000-000000000206";
+    const deleted = await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${auth}`)
+      .send({
+        deviceId: "public-device",
+        accountEpoch: created.body.accountEpoch,
+        cursor: created.body.cursor,
+        mutations: [{ mutationId: deleteMutationId, type: "delete", profileId: profile.id }],
+      }).expect(200);
+    expect(deleted.body.acknowledgedMutationIds).toEqual([deleteMutationId]);
+    expect(deleted.body.profiles).toEqual([
+      expect.objectContaining({ ...profile, revision: "2", deletedAt: expect.any(String) }),
+    ]);
+  });
+
   test("keeps mutation idempotency for the account epoch after the 90-day receipt expires", async () => {
     const subject = "durable-dedup-user";
     const auth = await token(subject);

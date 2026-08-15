@@ -69,6 +69,8 @@ The stable deployment must provide TLS termination for the API, TLS validation f
 | **`POST /v1/sync`** | Authenticated profile mutations and cursor delta |
 | **`DELETE /v1/account-data`** | Deletes hosted data and rotates the user's epoch |
 
+`POST /v1/sync` accepts the stable ecosystem v1 fields (`accountEpoch`, mutation `type`, and `SyncProfileV1`) as well as the desktop's paginated transport (`epoch`, mutation `kind`, receipts, records, and `hasMore`). A request must use one shape consistently. Responses contain both projections: `accountEpoch`, `acknowledgedMutationIds`, and `profiles` for the public contract, plus the paginated fields used by the desktop. The public projection preserves tombstone profile metadata so a delete delta includes `deletedAt`; account deletion still removes every profile and tombstone.
+
 Both account endpoints require an RS256 token with the configured issuer, audience, subject, and `rootline:profiles:sync` permission. Tenant ownership always comes from the verified `sub`; request bodies cannot select another tenant. Requests are limited to 256 KiB, 100 mutations, and 60 authenticated requests per user per rolling minute. Profile names contain 1–80 characters, source and target paths contain 1–4096 characters, and exclusions contain at most 100 patterns of 1–256 characters each. The shared contract, API DTO, desktop editor, and native persistence boundary enforce these same limits.
 
 The built-in rolling limiter is process-local. Run one API replica for this version. Horizontal scaling requires a shared, subject-keyed limiter before adding replicas; an ingress-only IP limit is not equivalent to the per-user contract.

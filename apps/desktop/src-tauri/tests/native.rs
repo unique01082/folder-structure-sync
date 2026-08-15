@@ -2,7 +2,8 @@ use std::fs;
 
 use rootline_desktop::{
     apply_plan, detect_case_sensitive, random_vault_password, resolve_existing_vault_password,
-    scan_plan, CancellationToken, Database, DirectoryStatus, NativeErrorCode, Profile, ScanRequest,
+    scan_plan, CancellationToken, Database, DiffStatus, DirectoryStatus, NativeErrorCode, Profile,
+    ScanRequest,
 };
 use rusqlite::Connection;
 use tempfile::tempdir;
@@ -156,6 +157,43 @@ fn scans_additively_and_revalidates_before_mkdir() {
     )
     .unwrap_err();
     assert_eq!(error.code, NativeErrorCode::StalePlan);
+}
+
+#[cfg(unix)]
+#[test]
+fn reports_missing_exists_excluded_and_unreadable_diff_states_with_full_globs() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let source = tempdir().unwrap();
+    let target = tempdir().unwrap();
+    fs::create_dir_all(source.path().join("docs/api")).unwrap();
+    fs::create_dir(source.path().join("shared")).unwrap();
+    fs::create_dir_all(source.path().join("generated/deep/cache")).unwrap();
+    fs::create_dir(source.path().join("app1.log")).unwrap();
+    fs::create_dir(source.path().join("app10.log")).unwrap();
+    let locked = source.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::create_dir(target.path().join("shared")).unwrap();
+
+    let mut request = request(source.path(), target.path());
+    request.exclusions = vec!["generated/**/cache".into(), "app?.log".into()];
+    let result = scan_plan(&request, &CancellationToken::default());
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    let plan = result.unwrap();
+
+    let status = |path: &str| {
+        plan.diff_entries
+            .iter()
+            .find(|entry| entry.relative_path == path)
+            .map(|entry| entry.status)
+    };
+    assert_eq!(status("docs"), Some(DiffStatus::Missing));
+    assert_eq!(status("shared"), Some(DiffStatus::Exists));
+    assert_eq!(status("generated/deep/cache"), Some(DiffStatus::Excluded));
+    assert_eq!(status("app1.log"), Some(DiffStatus::Excluded));
+    assert_eq!(status("app10.log"), Some(DiffStatus::Missing));
+    assert_eq!(status("locked"), Some(DiffStatus::Unreadable));
 }
 
 #[test]

@@ -47,6 +47,28 @@ export const SYNC_MODES = ["additive"] as const;
 
 export type SyncMode = (typeof SYNC_MODES)[number];
 
+export type CaseSensitivity = "sensitive" | "insensitive";
+
+export interface DirectorySnapshot {
+  rootPath: string;
+  caseSensitivity: CaseSensitivity;
+  directories: readonly string[];
+  skippedLinks: readonly string[];
+}
+
+export interface PlanOperation {
+  id: string;
+  type: "create-directory";
+  relativePath: string;
+}
+
+export interface SyncPlan {
+  sourceRoot: string;
+  targetRoot: string;
+  operations: readonly PlanOperation[];
+  fingerprint: string;
+}
+
 /** A complete local profile, including the absolute paths intentionally synced by cloud. */
 export interface SyncProfile {
   id: string;
@@ -120,6 +142,36 @@ export interface CloudSyncResponse {
   receipts: readonly CloudMutationReceipt[];
 }
 
+/** Stable v1 wire contract retained for ecosystem clients and documentation. */
+export interface SyncProfileV1 {
+  id: string;
+  schemaVersion: 1;
+  name: string;
+  sourcePath: string;
+  targetPath: string;
+  exclusions: string[];
+  revision: string;
+  deletedAt: string | null;
+}
+
+export type SyncMutation =
+  | { mutationId: string; type: "upsert"; profile: SyncProfileV1 }
+  | { mutationId: string; type: "delete"; profileId: string };
+
+export interface SyncRequest {
+  deviceId: string;
+  accountEpoch: string | null;
+  cursor: string;
+  mutations: SyncMutation[];
+}
+
+export interface SyncResponse {
+  accountEpoch: string;
+  cursor: string;
+  acknowledgedMutationIds: string[];
+  profiles: SyncProfileV1[];
+}
+
 export interface AccountDataDeletionRequest {
   epoch: string;
 }
@@ -148,6 +200,13 @@ export const ROOTLINE_ERROR_CODES = {
   RATE_LIMITED: "RATE_LIMITED",
   VALIDATION_FAILED: "VALIDATION_FAILED",
   INTERNAL: "INTERNAL",
+  INVALID_ROOT: "INVALID_ROOT",
+  OVERLAPPING_ROOTS: "OVERLAPPING_ROOTS",
+  CREATE_FAILED: "CREATE_FAILED",
+  SYNC_OFFLINE: "SYNC_OFFLINE",
+  SYNC_REJECTED: "SYNC_REJECTED",
+  RESET_REQUIRED: "RESET_REQUIRED",
+  SCHEMA_UNSUPPORTED: "SCHEMA_UNSUPPORTED",
 } as const;
 
 export type RootlineErrorCode =

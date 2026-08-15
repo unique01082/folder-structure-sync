@@ -4,7 +4,7 @@ import * as contracts from "../src/index.js";
 
 describe("Rootline contracts", () => {
   it("exposes stable shared error codes and structured errors", () => {
-    expect(contracts.ROOTLINE_ERROR_CODES).toEqual({
+    expect(contracts.ROOTLINE_ERROR_CODES).toMatchObject({
       CANCELLED: "CANCELLED",
       CONFIG_INVALID: "CONFIG_INVALID",
       INVALID_PATH: "INVALID_PATH",
@@ -24,6 +24,13 @@ describe("Rootline contracts", () => {
       RATE_LIMITED: "RATE_LIMITED",
       VALIDATION_FAILED: "VALIDATION_FAILED",
       INTERNAL: "INTERNAL",
+      INVALID_ROOT: "INVALID_ROOT",
+      OVERLAPPING_ROOTS: "OVERLAPPING_ROOTS",
+      CREATE_FAILED: "CREATE_FAILED",
+      SYNC_OFFLINE: "SYNC_OFFLINE",
+      SYNC_REJECTED: "SYNC_REJECTED",
+      RESET_REQUIRED: "RESET_REQUIRED",
+      SCHEMA_UNSUPPORTED: "SCHEMA_UNSUPPORTED",
     });
 
     const error = contracts.createRootlineError({

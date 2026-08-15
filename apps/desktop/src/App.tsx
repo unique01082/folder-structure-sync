@@ -462,14 +462,15 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
               {plan.skippedLinks.length ? <p className="safety-note">{text.skipped(plan.skippedLinks.length)}</p> : null}
               {plan.missing.length === 0 ? (
                 <div className="empty-state"><Mark /><h2>{text.empty}</h2><p>{text.emptyBody}</p></div>
-              ) : (
+              ) : null}
+              {plan.diffEntries.length ? (
                 <DiffTree
-                  entries={plan.missing}
+                  entries={plan.diffEntries}
                   selected={selected}
                   onSelectionChange={setSelected}
                   labels={text.tree}
                 />
-              )}
+              ) : null}
               <div className="review-actions">
                 <button className="secondary-button" type="button" onClick={() => setStep("choose")}>{text.newPair}</button>
                 {plan.missing.length ? <button aria-label={text.apply} className="primary-button" type="button" disabled={selected.size === 0} onClick={() => void apply()}>{text.apply}<span>{selected.size.toLocaleString()}</span></button> : null}

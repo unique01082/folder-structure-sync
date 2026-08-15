@@ -1,7 +1,7 @@
 import { Type } from "class-transformer";
 import { PROFILE_LIMITS } from "@rootline/contracts";
 import {
-  ArrayMaxSize, IsArray, IsDateString, IsIn, IsOptional, IsString, IsUUID, MaxLength, MinLength, ValidateNested,
+  ArrayMaxSize, IsArray, IsDateString, IsIn, IsInt, IsOptional, IsString, IsUUID, MaxLength, MinLength, ValidateNested,
 } from "class-validator";
 import { CodePointLength } from "./code-point-length.validator.js";
 
@@ -15,22 +15,27 @@ export class SyncProfileDto {
   @IsString({ each: true })
   @CodePointLength(PROFILE_LIMITS.exclusions.pattern.min, PROFILE_LIMITS.exclusions.pattern.max, { each: true })
   exclusions!: string[];
-  @IsDateString() createdAt!: string;
-  @IsDateString() updatedAt!: string;
+  @IsOptional() @IsDateString() createdAt?: string;
+  @IsOptional() @IsDateString() updatedAt?: string;
   @IsOptional() @IsIn(["additive"]) syncMode?: "additive";
+  @IsOptional() @IsInt() schemaVersion?: number;
+  @IsOptional() @IsString() @MaxLength(128) revision?: string;
+  @IsOptional() @IsDateString() deletedAt?: string | null;
 }
 
 export class ProfileMutationDto {
   @IsUUID() mutationId!: string;
-  @IsIn(["upsert", "delete"]) kind!: "upsert" | "delete";
-  @IsDateString() occurredAt!: string;
+  @IsOptional() @IsIn(["upsert", "delete"]) kind?: "upsert" | "delete";
+  @IsOptional() @IsIn(["upsert", "delete"]) type?: "upsert" | "delete";
+  @IsOptional() @IsDateString() occurredAt?: string;
   @IsOptional() @ValidateNested() @Type(() => SyncProfileDto) profile?: SyncProfileDto;
   @IsOptional() @IsString() @MinLength(1) @MaxLength(128) profileId?: string;
 }
 
 export class SyncRequestDto {
   @IsString() @MinLength(1) @MaxLength(128) deviceId!: string;
-  @IsUUID() epoch!: string;
+  @IsOptional() @IsUUID() epoch?: string;
+  @IsOptional() @IsUUID() accountEpoch?: string | null;
   @IsOptional() @IsString() @MaxLength(512) cursor?: string;
   @IsArray() @ArrayMaxSize(100) @ValidateNested({ each: true }) @Type(() => ProfileMutationDto) mutations!: ProfileMutationDto[];
 }

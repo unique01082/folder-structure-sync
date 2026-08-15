@@ -58,7 +58,7 @@ function usage(): string {
     "  -v, --verbose       Include scan details in text output",
     "  -a, --auto          Create every missing folder without prompts",
     "      --config <path> Read exclusions from this JSON file",
-    "      --json          Emit one JSON document and never prompt",
+    "      --json          Emit one JSON document; requires --dry-run or --auto",
     "      --version       Print the package version",
   ].join("\n");
 }
@@ -93,6 +93,9 @@ function parseArguments(arguments_: readonly string[]): CliOptions {
   }
   if (!help && !showVersion && positional.length !== 2) {
     throw new UsageError("Source and target arguments are required.");
+  }
+  if (!help && !showVersion && json && !dryRun && !auto) {
+    throw new UsageError("--json requires --dry-run or --auto.");
   }
   return { source: positional[0], target: positional[1], dryRun, verbose, auto, json, configPath, help, version: showVersion };
 }
@@ -130,7 +133,8 @@ export async function run(
       resolve(cwd, options.source!),
       resolve(cwd, options.target!),
     );
-    validateRootRelationship(sourcePath, targetPath, config.targetCaseSensitive);
+    const targetCaseSensitive = config.targetCaseSensitive ?? await adapter.detectCaseSensitivity(targetPath);
+    validateRootRelationship(sourcePath, targetPath, targetCaseSensitive);
     const source = await adapter.scanDirectories(sourcePath, config.exclusions, "source");
     let targetStatus = await adapter.ensureTarget(targetPath, options.dryRun || !options.auto);
     if (targetStatus === "would-create" && !options.dryRun && !options.json) {
@@ -140,9 +144,15 @@ export async function run(
       targetStatus = await adapter.ensureTarget(targetPath);
     }
     const target = targetStatus === "would-create"
-      ? { snapshot: createSnapshot([]), skippedSymlinks: [] }
+      ? {
+          snapshot: createSnapshot([], {
+            rootPath: targetPath,
+            caseSensitivity: targetCaseSensitive ? "sensitive" : "insensitive",
+          }),
+          skippedSymlinks: [],
+        }
       : await adapter.scanDirectories(targetPath, config.exclusions, "target");
-    const plan = createSyncPlan(source.snapshot, target.snapshot, config.targetCaseSensitive);
+    const plan = createSyncPlan(source.snapshot, target.snapshot, targetCaseSensitive);
     const output: CliOutput = {
       source: { entries: source.snapshot.entries.length, skippedSymlinks: source.skippedSymlinks },
       target: { status: targetStatus, entries: target.snapshot.entries.length },

@@ -18,9 +18,9 @@ Configuration resolution is deliberately narrow: an explicit `--config` path win
 }
 ```
 
-`defaultExclusions` replaces the built-in list when present. `customExclusions` is appended. Patterns match path segments and Rootline prunes the complete matching subtree. `targetCaseSensitive` defaults to `false` on macOS/Windows and `true` elsewhere; set it only when the target filesystem's actual semantics differ.
+`defaultExclusions` replaces the built-in list when present. `customExclusions` is appended. Patterns without `/` match a basename at any depth; patterns with `/` match a complete POSIX relative path. `*`, `?`, and `**` are supported and a match prunes the complete subtree. Rootline detects the target filesystem's case behavior without writing probe files; `targetCaseSensitive` is an explicit override for unusual or unavailable platform metadata.
 
-`--dry-run` never creates a missing target. `--json` never prompts. Use `--auto --json` for non-interactive application, and treat exit codes `1` and `2` as failures.
+`--dry-run` never creates a missing target. `--json` is valid only with `--dry-run` or `--auto` and never prompts. Use `--auto --json` for non-interactive application, and treat exit codes `1` and `2` as failures.
 
 ## Desktop profiles
 

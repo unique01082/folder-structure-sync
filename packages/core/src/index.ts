@@ -6,12 +6,27 @@ import {
 
 export { ROOTLINE_ERROR_CODES, RootlineError, createRootlineError };
 
+export type CaseSensitivity = "sensitive" | "insensitive";
+
 export interface DirectorySnapshot {
+  readonly rootPath: string;
+  readonly caseSensitivity: CaseSensitivity;
+  readonly directories: readonly string[];
+  readonly skippedLinks: readonly string[];
   readonly entries: readonly string[];
   readonly fingerprint: string;
 }
 
+export interface PlanOperation {
+  readonly id: string;
+  readonly type: "create-directory";
+  readonly relativePath: string;
+}
+
 export interface SyncPlan {
+  readonly sourceRoot: string;
+  readonly targetRoot: string;
+  readonly operations: readonly PlanOperation[];
   readonly sourceFingerprint: string;
   readonly targetFingerprint: string;
   readonly targetCaseSensitive: boolean;
@@ -49,8 +64,26 @@ export function normalizeRelativePath(value: string): string {
 }
 
 function globToRegExp(pattern: string): RegExp {
-  const escaped = pattern.replace(/[|\\{}()[\]^$+?.]/g, "\\$&").replace(/\*/g, "[^/]*");
-  return new RegExp(`^${escaped}$`);
+  let expression = "";
+  for (let index = 0; index < pattern.length; index += 1) {
+    const token = pattern[index]!;
+    if (token === "*" && pattern[index + 1] === "*") {
+      index += 1;
+      if (pattern[index + 1] === "/") {
+        index += 1;
+        expression += "(?:.*/)?";
+      } else {
+        expression += ".*";
+      }
+    } else if (token === "*") {
+      expression += "[^/]*";
+    } else if (token === "?") {
+      expression += "[^/]";
+    } else {
+      expression += token.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
+    }
+  }
+  return new RegExp(`^${expression}$`);
 }
 
 /** Matches complete path segments, so `.git` never also excludes `.github`. */
@@ -92,21 +125,44 @@ export function compareRelativePaths(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-export function createSnapshot(entries: readonly string[]): DirectorySnapshot {
+export interface SnapshotMetadata {
+  readonly rootPath?: string;
+  readonly caseSensitivity?: CaseSensitivity;
+  readonly skippedLinks?: readonly string[];
+}
+
+export function createSnapshot(entries: readonly string[], metadata: SnapshotMetadata = {}): DirectorySnapshot {
   const normalized = [...new Set(entries.map(normalizeRelativePath).filter(Boolean))].sort(compareRelativePaths);
-  return Object.freeze({ entries: Object.freeze(normalized), fingerprint: fingerprint(normalized) });
+  const directories = Object.freeze(normalized);
+  return Object.freeze({
+    rootPath: metadata.rootPath ?? "",
+    caseSensitivity: metadata.caseSensitivity ?? "sensitive",
+    directories,
+    skippedLinks: Object.freeze([...(metadata.skippedLinks ?? [])]),
+    entries: directories,
+    fingerprint: fingerprint(normalized),
+  });
 }
 
 export function createSyncPlan(
   source: DirectorySnapshot,
   target: DirectorySnapshot,
-  targetCaseSensitive = true,
+  targetCaseSensitive = target.caseSensitivity === "sensitive",
 ): SyncPlan {
   const comparable = (entry: string) => targetCaseSensitive ? entry : entry.toLowerCase();
   const targetEntries = new Set(target.entries.map(comparable));
   const missing = source.entries.filter((entry) => !targetEntries.has(comparable(entry)));
-  const planEntries = [source.fingerprint, target.fingerprint, targetCaseSensitive ? "case-sensitive" : "case-insensitive", ...missing];
+  const operations = missing.map((relativePath) => Object.freeze({
+    id: fingerprint([source.rootPath, target.rootPath, relativePath]),
+    type: "create-directory" as const,
+    relativePath,
+  }));
+  const rootBinding = source.rootPath || target.rootPath ? [source.rootPath, target.rootPath] : [];
+  const planEntries = [...rootBinding, source.fingerprint, target.fingerprint, targetCaseSensitive ? "case-sensitive" : "case-insensitive", ...missing];
   return Object.freeze({
+    sourceRoot: source.rootPath,
+    targetRoot: target.rootPath,
+    operations: Object.freeze(operations),
     sourceFingerprint: source.fingerprint,
     targetFingerprint: target.fingerprint,
     targetCaseSensitive,
@@ -164,7 +220,9 @@ export function assertPlanFresh(
   source: DirectorySnapshot,
   target: DirectorySnapshot,
 ): void {
-  const expected = createSyncPlan(source, target, plan.targetCaseSensitive);
+  const expectedSource = plan.sourceRoot ? source : createSnapshot(source.entries);
+  const expectedTarget = plan.targetRoot ? target : createSnapshot(target.entries);
+  const expected = createSyncPlan(expectedSource, expectedTarget, plan.targetCaseSensitive);
   if (
     plan.sourceFingerprint !== source.fingerprint ||
     plan.targetFingerprint !== target.fingerprint ||
