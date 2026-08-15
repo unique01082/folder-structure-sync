@@ -83,7 +83,7 @@ describe("Node filesystem adapter", () => {
     });
   });
 
-  it("reports an unreadable child directory instead of silently creating an incomplete snapshot", async () => {
+  it.runIf(process.platform !== "win32")("reports an unreadable child directory instead of silently creating an incomplete snapshot", async () => {
     const root = await tempDirectory();
     const locked = join(root, "locked");
     await mkdir(locked);

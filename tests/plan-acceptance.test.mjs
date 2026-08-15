@@ -37,6 +37,9 @@ test("Task 1 preserves the exact npm 1.1.0 baseline and workspace contract", () 
   assert.deepEqual(manifests.filter((manifest) => manifest.private !== true).map((manifest) => manifest.name), ["folder-structure-sync"]);
   assert.equal(manifests[0].private, true);
   assert.match(manifests[0].engines.node, />=20/);
+  assert.match(manifests[0].scripts.prepare, /build:workspace-deps/);
+  assert.match(manifests[0].scripts.typecheck, /build:workspace-deps/);
+  assert.match(manifests[0].scripts.test, /build:workspace-deps/);
   assert.match(read("pnpm-workspace.yaml"), /apps\/\*/);
   assert.match(read("pnpm-workspace.yaml"), /packages\/\*/);
 });

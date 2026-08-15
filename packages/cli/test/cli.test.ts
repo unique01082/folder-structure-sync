@@ -8,6 +8,7 @@ import { run as runProgram } from "../src/index.js";
 
 const directories: string[] = [];
 const cliPath = join(process.cwd(), "dist", "index.js");
+const pnpmCommand = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
 
 async function tempDirectory(): Promise<string> {
   const directory = await realpath(await mkdtemp(join(tmpdir(), "rootline-command-test-")));
@@ -20,7 +21,7 @@ function run(...arguments_: string[]) {
 }
 
 beforeAll(() => {
-  const build = spawnSync("pnpm", ["--filter", "folder-structure-sync", "build"], {
+  const build = spawnSync(pnpmCommand, ["--filter", "folder-structure-sync", "build"], {
     cwd: join(process.cwd(), "../.."),
     encoding: "utf8",
   });

@@ -7,6 +7,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 const workspace = join(process.cwd(), "../..");
 const scratch = await realpath(await mkdtemp(join(tmpdir(), "rootline-package-smoke-")));
+const pnpmCommand = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
 
 function execute(command: string, arguments_: string[], cwd = workspace) {
   const result = spawnSync(command, arguments_, {
@@ -26,10 +27,10 @@ afterAll(async () => {
 
 describe("published CLI package", () => {
   it("installs from the public CLI tarball alone and runs the folder-sync binary", async () => {
-    execute("pnpm", ["--filter", "@rootline/contracts", "build"]);
-    execute("pnpm", ["--filter", "@rootline/core", "build"]);
-    execute("pnpm", ["--filter", "folder-structure-sync", "build"]);
-    execute("pnpm", ["--filter", "folder-structure-sync", "pack", "--pack-destination", scratch]);
+    execute(pnpmCommand, ["--filter", "@rootline/contracts", "build"]);
+    execute(pnpmCommand, ["--filter", "@rootline/core", "build"]);
+    execute(pnpmCommand, ["--filter", "folder-structure-sync", "build"]);
+    execute(pnpmCommand, ["--filter", "folder-structure-sync", "pack", "--pack-destination", scratch]);
 
     const install = join(scratch, "install");
     const source = join(scratch, "source");
