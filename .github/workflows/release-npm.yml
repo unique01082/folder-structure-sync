@@ -38,7 +38,7 @@ jobs:
             exit 1
           fi
           if [ -z "${NPM_TOKEN}" ]; then
-            echo "::error::Stable npm release blocked. Configure the NPM_TOKEN repository secret with publish access to folder-structure-sync."
+            echo "::error::Stable npm release blocked. Configure NPM_TOKEN as a protected npm-production environment secret with publish access to folder-structure-sync."
             exit 1
           fi
           node -e "const p=require('./packages/cli/package.json'); if(p.version !== '2.0.0') throw new Error('packages/cli/package.json must be version 2.0.0')"

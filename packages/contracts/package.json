@@ -1,7 +1,8 @@
 {
   "name": "@rootline/contracts",
   "version": "2.0.0",
-  "description": "Public domain and cloud contracts for Rootline by baole.space",
+  "private": true,
+  "description": "Internal exported domain and cloud contracts for Rootline by baole.space",
   "license": "ISC",
   "type": "module",
   "exports": {

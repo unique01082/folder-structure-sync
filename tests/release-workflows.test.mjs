@@ -29,6 +29,16 @@ test("all workflows are valid YAML", () => {
   }
 });
 
+test("every third-party action is pinned to a full immutable commit SHA", () => {
+  for (const name of workflows) {
+    const actionReferences = [...workflow(name).matchAll(/uses:\s*([\w.-]+\/[\w.-]+)@([^\s#]+)/g)];
+    assert.ok(actionReferences.length > 0, `${name} must use at least one pinned action`);
+    for (const [, action, reference] of actionReferences) {
+      assert.match(reference, /^[a-f0-9]{40}$/, `${name}: ${action} must use a full 40-character commit SHA`);
+    }
+  }
+});
+
 test("CI covers TypeScript quality, real PostgreSQL, Rust, npm smoke, and the supported Tauri targets", () => {
   const ci = workflow("ci.yml");
   for (const expected of [
@@ -67,6 +77,11 @@ test("npm 2.0.0 release fails closed before provenance publishing", () => {
   assert.match(release, /needs:\s*preflight/);
   assert.match(release, /if \[ "\$\{GITHUB_REF\}" != "refs\/tags\/v2\.0\.0" \]/);
   assert.equal(parsedWorkflow("release-npm.yml").jobs.preflight.environment, "npm-production");
+  assert.match(release, /protected npm-production environment secret/);
+  assert.doesNotMatch(release, /repository secret/);
+  const releaseDocs = readFileSync(join(root, "docs", "release.md"), "utf8");
+  assert.match(releaseDocs, /protected `npm-production` environment secret `NPM_TOKEN`/);
+  assert.match(releaseDocs, /Never configure this credential as a repository secret/);
   assert.deepEqual(jobScopedSecrets("release-npm.yml"), []);
   const npmJobs = parsedWorkflow("release-npm.yml").jobs;
   assert.equal(npmJobs.pack.permissions["id-token"], undefined);
@@ -83,6 +98,17 @@ test("npm 2.0.0 release fails closed before provenance publishing", () => {
     url: "git+https://github.com/unique01082/folder-structure-sync.git",
   });
   assert.equal(manifest.engines.node, ">=20");
+});
+
+test("only the bundled CLI is a public npm workspace package", () => {
+  const contracts = JSON.parse(readFileSync(join(root, "packages", "contracts", "package.json"), "utf8"));
+  const core = JSON.parse(readFileSync(join(root, "packages", "core", "package.json"), "utf8"));
+  const cli = JSON.parse(readFileSync(join(root, "packages", "cli", "package.json"), "utf8"));
+
+  assert.equal(contracts.private, true);
+  assert.equal(core.private, true);
+  assert.notEqual(cli.private, true);
+  assert.match(contracts.description, /Internal/);
 });
 
 test("API release gates registry, migration, deployment, and HTTPS health secrets", () => {
@@ -141,8 +167,18 @@ test("desktop release requires platform signing and updater signing for every st
   assert.doesNotMatch(release, /nsis\.zip/);
   assert.match(release, /setup\.exe\.sig/);
   assert.match(release, /needs:\s*preflight/);
-  assert.equal(parsedWorkflow("release-desktop.yml").jobs.preflight.environment, "desktop-production");
+  const desktopJobs = parsedWorkflow("release-desktop.yml").jobs;
+  assert.equal(desktopJobs.preflight.environment, "desktop-production");
+  assert.equal(desktopJobs["macos-universal"].needs, "preflight");
+  assert.equal(desktopJobs.windows.needs, "preflight");
+  assert.deepEqual(desktopJobs["publish-release"].needs, ["preflight", "macos-universal", "windows"]);
   assert.deepEqual(jobScopedSecrets("release-desktop.yml"), []);
+  const preflight = JSON.stringify(parsedWorkflow("release-desktop.yml").jobs.preflight.steps);
+  assert.match(preflight, /tauri signer sign/);
+  assert.match(preflight, /minisign -Vm/);
+  assert.match(preflight, /base64 --decode/);
+  assert.match(preflight, /private key, password, and public key do not form one updater keypair/);
+  assert.doesNotMatch(preflight, /continue-on-error/);
 });
 
 test("desktop updater is registered and serves every default runtime target", () => {
@@ -162,4 +198,15 @@ test("desktop updater is registered and serves every default runtime target", ()
   for (const target of ["darwin-aarch64", "darwin-x86_64", "windows-x86_64", "windows-aarch64"]) {
     assert.match(manifest, new RegExp(`\\"${target}\\"`));
   }
+});
+
+test("release and privacy docs describe the real ordering and lazy receipt cleanup", () => {
+  const release = readFileSync(join(root, "docs", "release.md"), "utf8");
+  const privacy = readFileSync(join(root, "docs", "privacy.md"), "utf8");
+  const migrationIndex = release.indexOf("applies the checked-in migrations");
+  const deploymentIndex = release.indexOf("calls the HTTPS deployment webhook");
+
+  assert.ok(migrationIndex >= 0 && deploymentIndex >= 0 && migrationIndex < deploymentIndex);
+  assert.match(privacy, /eligible for cleanup after 90 days/i);
+  assert.match(privacy, /opportunistically on a later sync/i);
 });

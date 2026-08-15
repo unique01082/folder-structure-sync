@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Product display name is `Rootline by baole.space`; Tauri identifier is `space.baole.rootline`.
-- Keep npm package `folder-structure-sync` and binary `folder-sync`; release all workspace packages as product version `2.0.0` where public.
+- Keep npm package `folder-structure-sync` and binary `folder-sync`; it is the only public npm package. Keep private workspace packages version-aligned at `2.0.0` without publishing them.
 - Sync is one-way source to target and additive only: create missing directories, never copy/delete files or directories.
 - Source and target may not be equal, ancestors, or descendants. Skip symlinks and Windows junctions.
 - Node minimum is 20. CLI keeps `--dry-run`, `--verbose`, and `--auto`, and adds `--config` and `--json`.
@@ -26,7 +26,7 @@
 
 ### Task 1: Recover the Published Baseline and Establish Workspace Contracts
 
-Recover the exact npm `1.1.0` tarball, verify its registry integrity, document its unreachable original git head, and preserve the `.ignore` directory-pruning behavior without rewriting history. Convert the repository into a pnpm workspace with root orchestration, shared TypeScript/Vitest configuration, `packages/contracts`, and skeleton packages/apps. Define and test the public domain/cloud types and shared error codes. Do not implement filesystem algorithms, UI behavior, database persistence, or API endpoints yet.
+Recover the exact npm `1.1.0` tarball, verify its registry integrity, document its unreachable original git head, and preserve the `.ignore` directory-pruning behavior without rewriting history. Convert the repository into a pnpm workspace with root orchestration, shared TypeScript/Vitest configuration, `packages/contracts`, and skeleton packages/apps. Define and test the exported workspace domain/cloud types and shared error codes. Do not implement filesystem algorithms, UI behavior, database persistence, or API endpoints yet.
 
 Acceptance: frozen pnpm install succeeds; contracts tests, typecheck, and package builds pass; npm `1.1.0` recovery evidence is checked into docs; old root implementation remains available as migration evidence but is no longer the future package entry point.
 

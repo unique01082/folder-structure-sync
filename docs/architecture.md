@@ -4,7 +4,7 @@
 
 | Component | Ownership |
 |---|---|
-| `packages/contracts` | Stable domain, cloud, error, and DTO contracts |
+| `packages/contracts` | Private workspace package exporting stable domain, cloud, error, and DTO contracts |
 | `packages/core` | Environment-independent snapshot, exclusion, planning, selection, and validation logic |
 | `packages/cli` | Node filesystem adapter and the public `folder-sync` binary |
 | `apps/desktop` | React workflow plus the Tauri 2 native boundary |

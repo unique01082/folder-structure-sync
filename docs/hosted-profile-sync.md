@@ -73,7 +73,7 @@ Both account endpoints require an RS256 token with the configured issuer, audien
 
 The built-in rolling limiter is process-local. Run one API replica for this version. Horizontal scaling requires a shared, subject-keyed limiter before adding replicas; an ingress-only IP limit is not equivalent to the per-user contract.
 
-Server commit arrival order is last-write-wins. Every accepted mutation advances a per-user revision, deletes become tombstones, and mutation receipts remain idempotent for 90 days. Account deletion clears profiles, tombstones, changes, and receipts, then rotates the epoch. A stale device receives `SYNC_EPOCH_RESET_REQUIRED` and cannot silently resurrect deleted data.
+Server commit arrival order is last-write-wins. Every accepted mutation advances a per-user revision, deletes become tombstones, and mutation receipts remain eligible for idempotent replay for 90 days. Expired receipts are purged opportunistically during a later sync. Account deletion clears profiles, tombstones, changes, and receipts, then rotates the epoch. A stale device receives `SYNC_EPOCH_RESET_REQUIRED` and cannot silently resurrect deleted data.
 
 Mutation IDs are bound to a canonical content hash; reuse with different content returns 409 instead of silently dropping a change. Delta pages contain at most 100 records and approximately 1 MiB of record JSON. `hasMore` and the returned cursor let the desktop drain long-offline deltas while enforcing a 2 MiB streaming response cap.
 

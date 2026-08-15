@@ -23,6 +23,14 @@ jobs:
     environment: desktop-production
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Install minisign for updater key-pair proof
+        run: sudo apt-get update && sudo apt-get install --yes minisign
       - name: Require stable tag, release confirmation, signing credentials, and hosted profile endpoints
         env:
           CONFIRMATION: ${{ inputs.confirmation }}
@@ -63,6 +71,34 @@ jobs:
           case "${VITE_AUTHENTIK_ISSUER}" in https://*) ;; *) echo "::error::VITE_AUTHENTIK_ISSUER must use HTTPS."; exit 1 ;; esac
           case "${VITE_ROOTLINE_SYNC_API}" in https://*) ;; *) echo "::error::VITE_ROOTLINE_SYNC_API must use HTTPS."; exit 1 ;; esac
           node -e "const p=require('./apps/desktop/package.json'); if(p.version !== '2.0.0') throw new Error('apps/desktop/package.json must be version 2.0.0')"
+      - name: Prove updater private key, password, and public key match
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+        run: |
+          set -eu
+          challenge="$RUNNER_TEMP/rootline-updater-key-pair-challenge"
+          signature="$challenge.sig"
+          public_key="$RUNNER_TEMP/rootline-updater-public.key"
+          minisign_signature="$RUNNER_TEMP/rootline-updater-challenge.minisig"
+          printf '%s\n' "rootline-updater-key-pair-v2.0.0-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" > "$challenge"
+          if ! pnpm --filter @rootline/desktop tauri signer sign "$challenge" >/dev/null; then
+            echo "::error::Stable desktop release blocked: TAURI_SIGNING_PRIVATE_KEY or its password is invalid."
+            exit 1
+          fi
+          if ! printf '%s' "$TAURI_UPDATER_PUBLIC_KEY" | base64 --decode > "$public_key"; then
+            echo "::error::Stable desktop release blocked: TAURI_UPDATER_PUBLIC_KEY is not valid base64."
+            exit 1
+          fi
+          if ! base64 --decode < "$signature" > "$minisign_signature"; then
+            echo "::error::Stable desktop release blocked: Tauri produced an invalid updater signature."
+            exit 1
+          fi
+          if ! minisign -Vm "$challenge" -p "$public_key" -x "$minisign_signature" >/dev/null; then
+            echo "::error::Stable desktop release blocked: private key, password, and public key do not form one updater keypair."
+            exit 1
+          fi
 
   macos-universal:
     needs: preflight
