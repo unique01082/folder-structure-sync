@@ -16,6 +16,57 @@ fn request(source: &std::path::Path, target: &std::path::Path) -> ScanRequest {
     }
 }
 
+fn create_v5_database_with_invalid_profile(path: &std::path::Path, profile: &Profile) {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(&format!(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (1);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (2);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (3);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (4);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (5);",
+            include_str!("../migrations/0001_offline_state.sql"),
+            include_str!("../migrations/0002_account_scoped_sync.sql"),
+            include_str!("../migrations/0003_sync_session_generation.sql"),
+            include_str!("../migrations/0004_consented_epoch_adoption.sql"),
+            include_str!("../migrations/0005_sync_lifecycle_generation.sql"),
+        ))
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO profiles(id, name, source_path, target_path, exclusions_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, '[]', ?5, ?6)",
+            rusqlite::params![
+                profile.id,
+                profile.name,
+                profile.source_path,
+                profile.target_path,
+                profile.created_at,
+                profile.updated_at
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO mutation_outbox(mutation_id, kind, payload, occurred_at, profile_id)
+             VALUES (?1, 'upsert', ?2, ?3, ?4)",
+            rusqlite::params![
+                "00000000-0000-4000-8007-000000000001",
+                serde_json::to_string(profile).unwrap(),
+                profile.updated_at,
+                profile.id
+            ],
+        )
+        .unwrap();
+}
+
 #[test]
 fn scans_additively_and_revalidates_before_mkdir() {
     let source = tempdir().unwrap();
@@ -182,6 +233,31 @@ fn case_detection_is_read_only_and_overlap_wins_before_target_inspection() {
     let implementation = include_str!("../src/lib.rs");
     assert!(!implementation.contains(".rootline-case-probe"));
     assert!(!implementation.contains("create_new(true)"));
+    assert!(!implementation.contains("validate_relationship(&source, &target, !cfg!"));
+}
+
+#[test]
+fn actual_volume_metadata_controls_case_distinct_sibling_overlap() {
+    let parent = tempdir().unwrap();
+    let case_sensitive = detect_case_sensitive(parent.path()).unwrap();
+    let source = parent.path().join("Foo");
+    let target = parent.path().join("foo");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(source.join("nested")).unwrap();
+
+    if case_sensitive {
+        fs::create_dir(&target).unwrap();
+        let plan = scan_plan(&request(&source, &target), &CancellationToken::default()).unwrap();
+        assert_eq!(plan.missing, ["nested"]);
+        assert!(plan.target_case_sensitive);
+    } else {
+        assert_eq!(
+            scan_plan(&request(&source, &target), &CancellationToken::default())
+                .unwrap_err()
+                .code,
+            NativeErrorCode::PathOverlap,
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -306,12 +382,19 @@ fn migrates_and_persists_offline_state_with_bounded_history() {
 fn native_profile_limits_are_enforced_before_profile_or_outbox_persistence() {
     let directory = tempdir().unwrap();
     let database = Database::open(directory.path().join("profile-limits.sqlite3")).unwrap();
+    let exact_code_points = |count: usize| {
+        format!(
+            "{}{}",
+            "✈️".repeat(count / 2),
+            if count % 2 == 1 { "x" } else { "" }
+        )
+    };
     let boundary = Profile {
         id: "boundary".into(),
-        name: "n".repeat(80),
-        source_path: "s".repeat(4096),
-        target_path: "t".repeat(4096),
-        exclusions: (0..100).map(|_| "x".repeat(256)).collect(),
+        name: exact_code_points(80),
+        source_path: exact_code_points(4096),
+        target_path: exact_code_points(4096),
+        exclusions: (0..100).map(|_| exact_code_points(256)).collect(),
         created_at: "2026-08-15T00:00:00Z".into(),
         updated_at: "2026-08-15T00:00:00Z".into(),
     };
@@ -322,7 +405,7 @@ fn native_profile_limits_are_enforced_before_profile_or_outbox_persistence() {
     let invalid = [
         Profile {
             id: "bad-name".into(),
-            name: "n".repeat(81),
+            name: exact_code_points(81),
             ..boundary.clone()
         },
         Profile {
@@ -332,7 +415,7 @@ fn native_profile_limits_are_enforced_before_profile_or_outbox_persistence() {
         },
         Profile {
             id: "bad-target".into(),
-            target_path: "t".repeat(4097),
+            target_path: exact_code_points(4097),
             ..boundary.clone()
         },
         Profile {
@@ -342,7 +425,7 @@ fn native_profile_limits_are_enforced_before_profile_or_outbox_persistence() {
         },
         Profile {
             id: "bad-pattern".into(),
-            exclusions: vec!["x".repeat(257)],
+            exclusions: vec![exact_code_points(257)],
             ..boundary.clone()
         },
     ];
@@ -429,11 +512,33 @@ fn v5_upgrade_quarantines_invalid_outbox_without_removing_local_profiles_and_rec
     assert_eq!(quarantined.len(), 1);
     assert_eq!(quarantined[0].profile_id, invalid_profile.id);
     assert!(quarantined[0].reason.contains("name"));
-    database.claim_hosted_account("alice", true).unwrap();
+    assert_eq!(quarantined[0].provenance, "pre-login");
     assert_eq!(
-        database.hosted_sync_request("alice").unwrap()["mutations"],
-        serde_json::json!([])
+        database.hosted_sync_request("alice").unwrap_err().code,
+        NativeErrorCode::SyncAccountClaimRequired
     );
+    database.claim_hosted_account("alice", true).unwrap();
+    let consented_empty = database.hosted_sync_request("alice").unwrap();
+    assert_eq!(consented_empty["mutations"], serde_json::json!([]));
+    let local_epoch = consented_empty["epoch"].as_str().unwrap().to_owned();
+    let generation = database
+        .hosted_sync_generation("alice", &local_epoch, "")
+        .unwrap();
+    database
+        .apply_hosted_sync_response(
+            "alice",
+            &local_epoch,
+            "",
+            generation,
+            &serde_json::json!({
+                "epoch": local_epoch, "cursor": "empty-consented", "records": [], "receipts": []
+            }),
+        )
+        .unwrap();
+    assert!(database.preserves_consented_outbox("alice").unwrap());
+    database
+        .accept_account_epoch("alice", "00000000-0000-4000-8000-000000000701", false)
+        .unwrap();
 
     let corrected = Profile {
         name: "Corrected".into(),
@@ -449,6 +554,205 @@ fn v5_upgrade_quarantines_invalid_outbox_without_removing_local_profiles_and_rec
             .unwrap()
             .len(),
         1
+    );
+    assert_eq!(database.pending_outbox().unwrap().len(), 1);
+}
+
+#[test]
+fn v6_upgrade_backfills_existing_prelogin_quarantine_provenance() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("v6-quarantine.sqlite3");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(&format!(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (1);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (2);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (3);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (4);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (5);
+             {}
+             INSERT INTO schema_migrations(version) VALUES (6);
+             INSERT INTO mutation_quarantine(mutation_id, kind, profile_id, reason)
+             VALUES ('00000000-0000-4000-8007-000000000006', 'upsert',
+                     'legacy-prelogin', 'legacy invalid profile');",
+            include_str!("../migrations/0001_offline_state.sql"),
+            include_str!("../migrations/0002_account_scoped_sync.sql"),
+            include_str!("../migrations/0003_sync_session_generation.sql"),
+            include_str!("../migrations/0004_consented_epoch_adoption.sql"),
+            include_str!("../migrations/0005_sync_lifecycle_generation.sql"),
+            include_str!("../migrations/0006_invalid_outbox_quarantine.sql"),
+        ))
+        .unwrap();
+    drop(connection);
+
+    let database = Database::open(&path).unwrap();
+    let quarantined = database.quarantined_mutations().unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].profile_id, "legacy-prelogin");
+    assert_eq!(quarantined[0].provenance, "pre-login");
+    assert_eq!(
+        database.hosted_sync_request("alice").unwrap_err().code,
+        NativeErrorCode::SyncAccountClaimRequired,
+    );
+}
+
+#[test]
+fn keep_local_only_survives_quarantine_correction_epoch_and_account_switch_without_path_leakage() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("quarantine-local-only.sqlite3");
+    let invalid = Profile {
+        id: "legacy-private".into(),
+        name: "n".repeat(81),
+        source_path: "/Users/alice/private/source".into(),
+        target_path: "/Volumes/alice/private/target".into(),
+        exclusions: vec![],
+        created_at: "2026-08-15T00:00:00Z".into(),
+        updated_at: "2026-08-15T00:00:00Z".into(),
+    };
+    create_v5_database_with_invalid_profile(&path, &invalid);
+    let database = Database::open(&path).unwrap();
+
+    assert_eq!(
+        database.hosted_sync_request("alice").unwrap_err().code,
+        NativeErrorCode::SyncAccountClaimRequired
+    );
+    database.claim_hosted_account("alice", false).unwrap();
+    let corrected = Profile {
+        name: "Corrected local only".into(),
+        updated_at: "2026-08-15T00:01:00Z".into(),
+        ..invalid
+    };
+    database.save_profile(&corrected).unwrap();
+    assert!(database.quarantined_mutations().unwrap().is_empty());
+    let alice = database.hosted_sync_request("alice").unwrap();
+    assert_eq!(alice["mutations"], serde_json::json!([]));
+    assert!(!alice.to_string().contains("/Users/alice/private"));
+    database
+        .accept_account_epoch("alice", "00000000-0000-4000-8000-000000000702", false)
+        .unwrap();
+    assert!(database.pending_outbox().unwrap().is_empty());
+
+    database.disconnect_hosted_account(false).unwrap();
+    assert_eq!(
+        database.hosted_sync_request("bob").unwrap_err().code,
+        NativeErrorCode::SyncAccountClaimRequired
+    );
+    database.claim_hosted_account("bob", false).unwrap();
+    let mut bob_correction = corrected.clone();
+    bob_correction.name = "Still local only".into();
+    bob_correction.updated_at = "2026-08-15T00:02:00Z".into();
+    database.save_profile(&bob_correction).unwrap();
+    let bob = database.hosted_sync_request("bob").unwrap();
+    assert_eq!(bob["mutations"], serde_json::json!([]));
+    assert!(!bob.to_string().contains("/Users/alice/private"));
+}
+
+#[test]
+fn quarantined_profile_blocks_remote_upsert_and_tombstone_until_corrected_save_and_delete() {
+    let directory = tempdir().unwrap();
+    let database = Database::open(directory.path().join("quarantine-conflict.sqlite3")).unwrap();
+    let mut local = Profile {
+        id: "quarantine-conflict".into(),
+        name: "Preserved local".into(),
+        source_path: "/local/source".into(),
+        target_path: "/local/target".into(),
+        exclusions: vec![],
+        created_at: "2026-08-15T00:00:00Z".into(),
+        updated_at: "2026-08-15T00:00:00Z".into(),
+    };
+    database.save_profile(&local).unwrap();
+    database.claim_hosted_account("alice", true).unwrap();
+    let initial = database.hosted_sync_request("alice").unwrap();
+    let epoch = initial["epoch"].as_str().unwrap().to_owned();
+    let generation = database
+        .hosted_sync_generation("alice", &epoch, "")
+        .unwrap();
+    database
+        .apply_hosted_sync_response(
+            "alice",
+            &epoch,
+            "",
+            generation,
+            &serde_json::json!({
+                "epoch": epoch, "cursor": "baseline", "records": [],
+                "receipts": [{ "mutationId": initial["mutations"][0]["mutationId"], "revision": 1 }]
+            }),
+        )
+        .unwrap();
+    let invalid = Profile {
+        name: "n".repeat(81),
+        ..local.clone()
+    };
+    database
+        .enqueue_mutation(
+            "00000000-0000-4000-8007-000000000099",
+            "upsert",
+            &serde_json::to_string(&invalid).unwrap(),
+            &invalid.updated_at,
+        )
+        .unwrap();
+    let quarantined_request = database.hosted_sync_request("alice").unwrap();
+    assert_eq!(quarantined_request["mutations"], serde_json::json!([]));
+    assert_eq!(database.quarantined_mutations().unwrap().len(), 1);
+
+    let generation = database
+        .hosted_sync_generation("alice", &epoch, "baseline")
+        .unwrap();
+    database
+        .apply_hosted_sync_response(
+            "alice",
+            &epoch,
+            "baseline",
+            generation,
+            &serde_json::json!({
+                "epoch": epoch, "cursor": "remote-upsert", "receipts": [],
+                "records": [{
+                    "kind": "profile", "revision": 2,
+                    "profile": {
+                        "id": local.id, "name": "Remote overwrite", "sourcePath": "/remote/source",
+                        "targetPath": "/remote/target", "exclusions": [],
+                        "createdAt": local.created_at, "updatedAt": "2026-08-15T01:00:00Z"
+                    }
+                }]
+            }),
+        )
+        .unwrap();
+    assert_eq!(database.list_profiles().unwrap(), [local.clone()]);
+
+    let generation = database
+        .hosted_sync_generation("alice", &epoch, "remote-upsert")
+        .unwrap();
+    database
+        .apply_hosted_sync_response(
+            "alice",
+            &epoch,
+            "remote-upsert",
+            generation,
+            &serde_json::json!({
+                "epoch": epoch, "cursor": "remote-delete", "receipts": [],
+                "records": [{ "kind": "tombstone", "revision": 3, "profileId": local.id }]
+            }),
+        )
+        .unwrap();
+    assert_eq!(database.list_profiles().unwrap(), [local.clone()]);
+
+    local.name = "Corrected local".into();
+    local.updated_at = "2026-08-15T02:00:00Z".into();
+    database.save_profile(&local).unwrap();
+    assert!(database.quarantined_mutations().unwrap().is_empty());
+    assert_eq!(database.pending_outbox().unwrap().len(), 1);
+    database.delete_profile(&local.id).unwrap();
+    assert!(database.list_profiles().unwrap().is_empty());
+    assert_eq!(
+        database.pending_outbox().unwrap().last().unwrap().kind,
+        "delete"
     );
 }
 
@@ -474,6 +778,11 @@ fn deleting_a_quarantined_profile_clears_its_actionable_status_and_queues_a_tomb
             &invalid.updated_at,
         )
         .unwrap();
+    assert_eq!(
+        database.hosted_sync_request("alice").unwrap_err().code,
+        NativeErrorCode::SyncAccountClaimRequired
+    );
+    database.claim_hosted_account("alice", true).unwrap();
     database.hosted_sync_request("alice").unwrap();
     assert_eq!(database.quarantined_mutations().unwrap().len(), 1);
 
@@ -1326,6 +1635,14 @@ fn hosted_state_cannot_cross_accounts_and_signout_quarantines_pending_paths() {
 
     database.disconnect_hosted_account(false).unwrap();
     assert_eq!(database.list_profiles().unwrap(), [profile]);
+    assert_eq!(
+        database
+            .hosted_sync_request("account-bob")
+            .unwrap_err()
+            .code,
+        NativeErrorCode::SyncAccountClaimRequired
+    );
+    database.claim_hosted_account("account-bob", false).unwrap();
     let bob = database.hosted_sync_request("account-bob").unwrap();
     assert_eq!(bob["mutations"], serde_json::json!([]));
     assert!(uuid::Uuid::parse_str(bob["epoch"].as_str().unwrap()).is_ok());

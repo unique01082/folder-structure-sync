@@ -13,6 +13,7 @@
     "build": "pnpm -r --if-present run build",
     "lint": "eslint \"apps/**/*.{ts,tsx}\" \"packages/**/*.ts\" \"scripts/**/*.mjs\" \"tests/**/*.mjs\" --max-warnings 0",
     "test": "pnpm -r --if-present run test",
+    "test:api-image": "sh apps/api/scripts/test-docker-image.sh",
     "test:unit": "pnpm --filter @rootline/contracts test && pnpm --filter @rootline/core test && pnpm --filter folder-structure-sync test:unit && pnpm --filter @rootline/desktop test",
     "test:release": "node --test tests/*.test.mjs",
     "validate:workflows": "node --test tests/release-workflows.test.mjs",

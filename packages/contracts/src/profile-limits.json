@@ -1,4 +1,5 @@
 {
+  "lengthUnit": "unicode-code-points",
   "name": { "min": 1, "max": 80 },
   "path": { "min": 1, "max": 4096 },
   "exclusions": { "max": 100, "pattern": { "min": 1, "max": 256 } }

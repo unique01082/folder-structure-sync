@@ -49,6 +49,26 @@ test("production dependency audits fail closed before CI and every release mutat
   assert.doesNotMatch(lockfile, /js-yaml@5\.2\.1/);
 });
 
+test("CI and API release build and health-smoke the production image before publishing it", () => {
+  const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+  assert.equal(manifest.scripts["test:api-image"], "sh apps/api/scripts/test-docker-image.sh");
+
+  const smoke = readFileSync(join(root, "apps", "api", "scripts", "test-docker-image.sh"), "utf8");
+  for (const expected of [
+    "docker build --file apps/api/Dockerfile",
+    "prisma migrate deploy",
+    "/healthz",
+    "JWT_JWKS_PATH",
+    "trap cleanup EXIT INT TERM",
+  ]) assert.match(smoke, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+
+  const ci = workflow("ci.yml");
+  const release = workflow("release-api.yml");
+  assert.match(ci, /pnpm test:api-image/);
+  assert.match(release, /pnpm test:api-image/);
+  assert.ok(release.indexOf("pnpm test:api-image") < release.indexOf("docker/build-push-action"));
+});
+
 test("every third-party action is pinned to a full immutable commit SHA", () => {
   for (const name of workflows) {
     const actionReferences = [...workflow(name).matchAll(/uses:\s*([\w.-]+\/[\w.-]+)@([^\s#]+)/g)];

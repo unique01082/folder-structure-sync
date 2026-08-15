@@ -49,26 +49,29 @@ describe("Rootline contracts", () => {
 
   it("exports the exact shared profile limits and runtime validation", () => {
     expect(contracts.PROFILE_LIMITS).toEqual({
+      lengthUnit: "unicode-code-points",
       name: { min: 1, max: 80 },
       path: { min: 1, max: 4096 },
       exclusions: { max: 100, pattern: { min: 1, max: 256 } },
     });
+    expect(contracts.codePointLength("✈️")).toBe(2);
+    const exactCodePoints = (count: number) => "✈️".repeat(Math.floor(count / 2)) + (count % 2 ? "x" : "");
     const valid = {
       id: "profile",
-      name: "n".repeat(80),
-      sourcePath: "/".repeat(4096),
-      targetPath: "C".repeat(4096),
-      exclusions: Array.from({ length: 100 }, () => "x".repeat(256)),
+      name: exactCodePoints(80),
+      sourcePath: exactCodePoints(4096),
+      targetPath: exactCodePoints(4096),
+      exclusions: Array.from({ length: 100 }, () => exactCodePoints(256)),
       createdAt: "2026-08-15T00:00:00Z",
       updatedAt: "2026-08-15T00:00:00Z",
     };
     expect(contracts.validateSyncProfile(valid)).toEqual([]);
     expect(contracts.validateSyncProfile({
       ...valid,
-      name: "n".repeat(81),
+      name: exactCodePoints(81),
       sourcePath: "",
-      targetPath: "t".repeat(4097),
-      exclusions: [...valid.exclusions, "", "x".repeat(257)],
+      targetPath: exactCodePoints(4097),
+      exclusions: [...valid.exclusions, "", exactCodePoints(257)],
     })).toEqual(expect.arrayContaining([
       expect.objectContaining({ field: "name" }),
       expect.objectContaining({ field: "sourcePath" }),

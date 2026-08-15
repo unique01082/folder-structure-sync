@@ -3,17 +3,17 @@ import { PROFILE_LIMITS } from "@rootline/contracts";
 import {
   ArrayMaxSize, IsArray, IsDateString, IsIn, IsOptional, IsString, IsUUID, MaxLength, MinLength, ValidateNested,
 } from "class-validator";
+import { CodePointLength } from "./code-point-length.validator.js";
 
 export class SyncProfileDto {
   @IsString() @MinLength(1) @MaxLength(128) id!: string;
-  @IsString() @MinLength(PROFILE_LIMITS.name.min) @MaxLength(PROFILE_LIMITS.name.max) name!: string;
-  @IsString() @MinLength(PROFILE_LIMITS.path.min) @MaxLength(PROFILE_LIMITS.path.max) sourcePath!: string;
-  @IsString() @MinLength(PROFILE_LIMITS.path.min) @MaxLength(PROFILE_LIMITS.path.max) targetPath!: string;
+  @IsString() @CodePointLength(PROFILE_LIMITS.name.min, PROFILE_LIMITS.name.max) name!: string;
+  @IsString() @CodePointLength(PROFILE_LIMITS.path.min, PROFILE_LIMITS.path.max) sourcePath!: string;
+  @IsString() @CodePointLength(PROFILE_LIMITS.path.min, PROFILE_LIMITS.path.max) targetPath!: string;
   @IsArray()
   @ArrayMaxSize(PROFILE_LIMITS.exclusions.max)
   @IsString({ each: true })
-  @MinLength(PROFILE_LIMITS.exclusions.pattern.min, { each: true })
-  @MaxLength(PROFILE_LIMITS.exclusions.pattern.max, { each: true })
+  @CodePointLength(PROFILE_LIMITS.exclusions.pattern.min, PROFILE_LIMITS.exclusions.pattern.max, { each: true })
   exclusions!: string[];
   @IsDateString() createdAt!: string;
   @IsDateString() updatedAt!: string;

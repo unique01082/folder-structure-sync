@@ -295,6 +295,69 @@ describe("Rootline desktop authentication boundary", () => {
     vi.useRealTimers();
   });
 
+  test("does not publish or retain a callback already in flight when sign-in is cancelled", async () => {
+    const stateStore = { getAllKeys: vi.fn(async () => []), remove: vi.fn() };
+    const callbackUser = {
+      profile: { sub: "cancelled-user", permissions: ["rootline:profiles:sync"] },
+      access_token: "cancelled-access",
+      expired: false,
+    };
+    let releaseCallback!: (user: typeof callbackUser) => void;
+    const callbackResult = new Promise<typeof callbackUser>((resolve) => { releaseCallback = resolve; });
+    const manager = {
+      settings: { stateStore },
+      getUser: vi.fn(async () => null),
+      signinRedirect: vi.fn(async () => undefined),
+      signinRedirectCallback: vi.fn(() => callbackResult),
+      clearStaleState: vi.fn(), revokeTokens: vi.fn(), removeUser: vi.fn(async () => undefined),
+    };
+    const auth = new DesktopAuthController(config, manager as never);
+    await auth.initialize();
+    await auth.signIn();
+    const callback = auth.handleCallback("rootline://auth/callback?code=cancelled&state=cancelled-state");
+    await vi.waitFor(() => expect(manager.signinRedirectCallback).toHaveBeenCalledTimes(1));
+    await auth.cancelSignIn();
+    releaseCallback(callbackUser);
+    await callback;
+
+    expect(auth.snapshot().user).toBeNull();
+    expect(manager.removeUser).toHaveBeenCalledTimes(1);
+    expect(tauriMocks.invoke).not.toHaveBeenCalledWith("sync_hosted_profiles", expect.anything());
+  });
+
+  test("does not publish or retain a callback already in flight when browser sign-in times out", async () => {
+    vi.useFakeTimers();
+    const stateStore = { getAllKeys: vi.fn(async () => []), remove: vi.fn() };
+    const callbackUser = {
+      profile: { sub: "timed-out-user", permissions: ["rootline:profiles:sync"] },
+      access_token: "timed-out-access",
+      expired: false,
+    };
+    let releaseCallback!: (user: typeof callbackUser) => void;
+    const callbackResult = new Promise<typeof callbackUser>((resolve) => { releaseCallback = resolve; });
+    const manager = {
+      settings: { stateStore },
+      getUser: vi.fn(async () => null),
+      signinRedirect: vi.fn(async () => undefined),
+      signinRedirectCallback: vi.fn(() => callbackResult),
+      clearStaleState: vi.fn(), revokeTokens: vi.fn(), removeUser: vi.fn(async () => undefined),
+    };
+    const auth = new DesktopAuthController(config, manager as never);
+    await auth.initialize();
+    await auth.signIn();
+    const callback = auth.handleCallback("rootline://auth/callback?code=timeout&state=timeout-state");
+    await vi.waitFor(() => expect(manager.signinRedirectCallback).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(OIDC_BROWSER_FLOW_TIMEOUT_MS);
+    releaseCallback(callbackUser);
+    await callback;
+
+    expect(auth.snapshot()).toEqual(expect.objectContaining({ user: null, error: "AUTH_SIGNIN_TIMEOUT" }));
+    expect(manager.removeUser).toHaveBeenCalledTimes(1);
+    expect(tauriMocks.invoke).not.toHaveBeenCalledWith("sync_hosted_profiles", expect.anything());
+    auth.dispose();
+    vi.useRealTimers();
+  });
+
   test("cleans a partial listener registration before retrying initialization", async () => {
     const firstDeepLinkUnlisten = vi.fn();
     const secondDeepLinkUnlisten = vi.fn();

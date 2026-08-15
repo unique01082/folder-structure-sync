@@ -13,10 +13,14 @@ WORKDIR /app
 RUN corepack enable
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
 COPY apps/api/package.json apps/api/package.json
+COPY packages/contracts/package.json packages/contracts/package.json
 RUN pnpm install --frozen-lockfile --filter @rootline/api...
 
 COPY apps/api apps/api
-RUN pnpm --filter @rootline/api prisma:generate && pnpm --filter @rootline/api build
+COPY packages/contracts packages/contracts
+RUN pnpm --filter @rootline/contracts build \
+  && pnpm --filter @rootline/api prisma:generate \
+  && pnpm --filter @rootline/api build
 
 FROM base AS runtime
 
@@ -32,6 +36,8 @@ COPY --from=build --chown=rootline:rootline /app/apps/api/node_modules /app/apps
 COPY --from=build --chown=rootline:rootline /app/apps/api/dist /app/apps/api/dist
 COPY --from=build --chown=rootline:rootline /app/apps/api/package.json /app/apps/api/package.json
 COPY --from=build --chown=rootline:rootline /app/apps/api/prisma /app/apps/api/prisma
+COPY --from=build --chown=rootline:rootline /app/packages/contracts/dist /app/packages/contracts/dist
+COPY --from=build --chown=rootline:rootline /app/packages/contracts/package.json /app/packages/contracts/package.json
 
 USER rootline
 EXPOSE 3000

@@ -220,16 +220,32 @@ describe("Rootline desktop workflow", () => {
   test("enforces shared profile limits in the UI with localized errors before native persistence", async () => {
     const user = userEvent.setup();
     const native = gateway();
-    render(<App gateway={native} initialProfile={{
-      id: "limits", name: "Valid", sourcePath: "/source", targetPath: "/target",
-      exclusions: [], createdAt: "x", updatedAt: "x",
-    }} />);
+    const exactCodePoints = (count: number) => "✈️".repeat(Math.floor(count / 2)) + (count % 2 ? "x" : "");
+    const boundary = {
+      id: "limits",
+      name: exactCodePoints(80),
+      sourcePath: exactCodePoints(4096),
+      targetPath: exactCodePoints(4096),
+      exclusions: Array.from({ length: 100 }, () => exactCodePoints(256)),
+      createdAt: "x",
+      updatedAt: "x",
+    };
+    const view = render(<App gateway={native} initialProfile={boundary} />);
     const name = screen.getByRole("textbox", { name: "Profile name" });
-    expect(name).toHaveAttribute("minlength", "1");
-    expect(name).toHaveAttribute("maxlength", "80");
+    expect(name).not.toHaveAttribute("minlength");
+    expect(name).not.toHaveAttribute("maxlength");
     expect(name).toBeRequired();
 
-    fireEvent.change(name, { target: { value: "n".repeat(81) } });
+    await user.click(screen.getByRole("button", { name: "Save profile" }));
+    expect(native.saveProfile).toHaveBeenCalledWith(expect.objectContaining({
+      name: boundary.name,
+      sourcePath: boundary.sourcePath,
+      targetPath: boundary.targetPath,
+      exclusions: boundary.exclusions,
+    }));
+    vi.mocked(native.saveProfile).mockClear();
+
+    fireEvent.change(name, { target: { value: exactCodePoints(81) } });
     await user.click(screen.getByRole("button", { name: "Save profile" }));
     expect(screen.getByRole("alert")).toHaveTextContent("Profile name must contain 1–80 characters.");
     expect(native.saveProfile).not.toHaveBeenCalled();
@@ -238,6 +254,19 @@ describe("Rootline desktop workflow", () => {
     await user.click(screen.getByRole("button", { name: "Lưu hồ sơ" }));
     expect(screen.getByRole("alert")).toHaveTextContent("Tên hồ sơ phải có từ 1–80 ký tự.");
     expect(native.saveProfile).not.toHaveBeenCalled();
+
+    view.unmount();
+    for (const invalidProfile of [
+      { ...boundary, id: "path-over", name: "Valid", sourcePath: exactCodePoints(4097) },
+      { ...boundary, id: "pattern-over", name: "Valid", exclusions: [exactCodePoints(257)] },
+      { ...boundary, id: "array-over", name: "Valid", exclusions: Array.from({ length: 101 }, () => "x") },
+    ]) {
+      const invalidView = render(<App gateway={native} initialProfile={invalidProfile} />);
+      await user.click(screen.getByRole("button", { name: "Save profile" }));
+      expect(screen.getByRole("alert")).toHaveTextContent("This profile exceeds Rootline’s limits.");
+      expect(native.saveProfile).not.toHaveBeenCalled();
+      invalidView.unmount();
+    }
   });
 
   test("localizes native profile validation failures without persisting UI state", async () => {

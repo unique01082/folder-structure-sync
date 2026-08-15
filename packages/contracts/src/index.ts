@@ -9,8 +9,9 @@ export interface ProfileValidationIssue {
   max: number;
 }
 
-function characterLength(value: string): number {
-  return [...value].length;
+/** Counts Unicode scalar/code-point values, not UTF-16 units or grapheme clusters. */
+export function codePointLength(value: string): number {
+  return Array.from(value).length;
 }
 
 /** Runtime validation shared by profile editors and transport boundaries. */
@@ -24,7 +25,7 @@ export function validateSyncProfile(
     ["targetPath", profile.targetPath, PROFILE_LIMITS.path],
   ] as const;
   for (const [field, value, limits] of lengths) {
-    const length = characterLength(value);
+    const length = codePointLength(value);
     if (length < limits.min || length > limits.max) {
       issues.push({ field, min: limits.min, max: limits.max });
     }
@@ -33,7 +34,7 @@ export function validateSyncProfile(
     issues.push({ field: "exclusions", max: PROFILE_LIMITS.exclusions.max });
   }
   profile.exclusions.forEach((pattern, index) => {
-    const length = characterLength(pattern);
+    const length = codePointLength(pattern);
     const limits = PROFILE_LIMITS.exclusions.pattern;
     if (length < limits.min || length > limits.max) {
       issues.push({ field: `exclusions[${index}]`, min: limits.min, max: limits.max });

@@ -16,6 +16,14 @@ fn post_sync(
         .unwrap()
 }
 
+fn exact_code_points(count: usize) -> String {
+    format!(
+        "{}{}",
+        "✈️".repeat(count / 2),
+        if count % 2 == 1 { "x" } else { "" }
+    )
+}
+
 #[test]
 #[ignore = "run by the real PostgreSQL API harness"]
 fn replays_a_consented_device_two_outbox_without_leaking_paths_to_another_account() {
@@ -26,10 +34,10 @@ fn replays_a_consented_device_two_outbox_without_leaking_paths_to_another_accoun
     let database = Database::open(directory.path().join("device-two.sqlite3")).unwrap();
     let local = Profile {
         id: "device-two-offline-profile".into(),
-        name: "Device two offline".into(),
-        source_path: "/Users/device-two/private/source".into(),
-        target_path: "/Volumes/device-two/backup".into(),
-        exclusions: vec![".git".into()],
+        name: exact_code_points(80),
+        source_path: exact_code_points(4096),
+        target_path: exact_code_points(4096),
+        exclusions: (0..100).map(|_| exact_code_points(256)).collect(),
         created_at: "2026-08-15T00:00:00.000Z".into(),
         updated_at: "2026-08-15T00:00:00.000Z".into(),
     };
@@ -50,9 +58,11 @@ fn replays_a_consented_device_two_outbox_without_leaking_paths_to_another_accoun
     assert_eq!(database.pending_outbox().unwrap().len(), 1);
 
     let reconnect = database.hosted_sync_request("seam-alice").unwrap();
-    assert!(reconnect
-        .to_string()
-        .contains("/Users/device-two/private/source"));
+    assert_eq!(reconnect["mutations"][0]["profile"]["name"], local.name);
+    assert_eq!(
+        reconnect["mutations"][0]["profile"]["sourcePath"],
+        local.source_path
+    );
     let generation = database
         .hosted_sync_generation("seam-alice", &server_epoch, "")
         .unwrap();
@@ -64,11 +74,24 @@ fn replays_a_consented_device_two_outbox_without_leaking_paths_to_another_accoun
         .apply_hosted_sync_response("seam-alice", &server_epoch, "", generation, &body)
         .unwrap();
     assert!(database.pending_outbox().unwrap().is_empty());
+    let persisted = database
+        .list_profiles()
+        .unwrap()
+        .into_iter()
+        .find(|profile| profile.id == local.id)
+        .expect("accepted Unicode profile must reach desktop SQLite");
+    assert_eq!(persisted, local);
+    assert_eq!(database.sync_cursor().unwrap().unwrap().1, body["cursor"]);
 
     database.disconnect_hosted_account(false).unwrap();
+    assert_eq!(
+        database.hosted_sync_request("seam-bob").unwrap_err().code,
+        rootline_desktop::NativeErrorCode::SyncAccountClaimRequired
+    );
+    database.claim_hosted_account("seam-bob", false).unwrap();
     let bob = database.hosted_sync_request("seam-bob").unwrap();
     assert_eq!(bob["mutations"], serde_json::json!([]));
-    assert!(!bob.to_string().contains("device-two/private"));
+    assert!(!bob.to_string().contains(&local.source_path));
     let bob_epoch = bob["epoch"].as_str().unwrap().to_owned();
     let bob_generation = database
         .hosted_sync_generation("seam-bob", &bob_epoch, "")

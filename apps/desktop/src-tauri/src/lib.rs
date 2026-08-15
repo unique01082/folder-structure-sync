@@ -648,7 +648,6 @@ pub fn scan_plan(
     token.check()?;
     let source = canonical_directory(&request.source_path, "source")?;
     let target = canonical_directory(&request.target_path, "target")?;
-    validate_relationship(&source, &target, !cfg!(any(target_os = "macos", windows)))?;
     let target_case_sensitive = detect_case_sensitive(&target)?;
     validate_relationship(&source, &target, target_case_sensitive)?;
     let source_snapshot = scan_root(&source, &request.exclusions, token)?;
@@ -848,6 +847,8 @@ struct ExclusionLimits {
 
 #[derive(Debug, Deserialize)]
 struct ProfileLimits {
+    #[serde(rename = "lengthUnit")]
+    length_unit: String,
     name: CharacterLimits,
     path: CharacterLimits,
     exclusions: ExclusionLimits,
@@ -877,6 +878,7 @@ fn validate_profile(profile: &Profile) -> Result<(), NativeError> {
         return Err(profile_validation_error("id", Some(1), 128));
     }
     let limits = profile_limits();
+    assert_eq!(limits.length_unit, "unicode-code-points");
     for (field, value, limit) in [
         ("name", profile.name.as_str(), &limits.name),
         ("sourcePath", profile.source_path.as_str(), &limits.path),
@@ -960,9 +962,18 @@ fn outbox_validation_error(
 }
 
 fn quarantine_invalid_outbox(connection: &mut Connection) -> Result<usize, NativeError> {
+    let owner = connection
+        .query_row(
+            "SELECT subject FROM sync_state WHERE singleton=1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_default();
     let candidates = {
         let mut statement = connection.prepare(
-            "SELECT sequence, mutation_id, kind, payload, occurred_at, profile_id
+            "SELECT sequence, mutation_id, kind, payload, occurred_at, profile_id,
+                    preserve_on_epoch_adopt
              FROM mutation_outbox ORDER BY sequence ASC",
         )?;
         let rows = statement.query_map([], |row| {
@@ -973,25 +984,54 @@ fn quarantine_invalid_outbox(connection: &mut Connection) -> Result<usize, Nativ
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
     let transaction = connection.transaction()?;
     let mut quarantined = 0;
-    for (sequence, mutation_id, kind, payload, occurred_at, profile_id) in candidates {
+    for (sequence, mutation_id, kind, payload, occurred_at, profile_id, preserve) in candidates {
         let Some(reason) = outbox_validation_error(&mutation_id, &kind, &payload, &occurred_at)
         else {
             continue;
         };
         transaction.execute(
-            "INSERT INTO mutation_quarantine(mutation_id, kind, profile_id, reason)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO mutation_quarantine(
+               mutation_id, kind, profile_id, reason, provenance, subject
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(mutation_id) DO UPDATE SET kind=excluded.kind,
                profile_id=excluded.profile_id, reason=excluded.reason,
+               provenance=excluded.provenance, subject=excluded.subject,
                quarantined_at=CURRENT_TIMESTAMP",
-            params![mutation_id, kind, profile_id, reason],
+            params![
+                mutation_id,
+                kind,
+                profile_id,
+                reason,
+                if owner.is_empty() {
+                    "pre-login"
+                } else {
+                    "account-bound"
+                },
+                owner
+            ],
         )?;
+        if !profile_id.is_empty() && owner.is_empty() {
+            transaction.execute(
+                "INSERT INTO profile_sync_policy(profile_id, policy, subject)
+                 VALUES (?1, 'unclaimed', '')
+                 ON CONFLICT(profile_id) DO NOTHING",
+                [&profile_id],
+            )?;
+        } else if !profile_id.is_empty() && preserve == 1 {
+            transaction.execute(
+                "INSERT INTO profile_sync_policy(profile_id, policy, subject)
+                 VALUES (?1, 'consented', ?2)
+                 ON CONFLICT(profile_id) DO UPDATE SET policy='consented', subject=excluded.subject",
+                params![profile_id, owner],
+            )?;
+        }
         transaction.execute(
             "DELETE FROM mutation_outbox WHERE sequence = ?1",
             [sequence],
@@ -1023,6 +1063,7 @@ pub struct QuarantinedMutation {
     pub mutation_id: String,
     pub profile_id: String,
     pub reason: String,
+    pub provenance: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1058,6 +1099,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (
         6,
         include_str!("../migrations/0006_invalid_outbox_quarantine.sql"),
+    ),
+    (
+        7,
+        include_str!("../migrations/0007_profile_sync_provenance.sql"),
     ),
 ];
 const HOSTED_SYNC_MUTATION_LIMIT: usize = 100;
@@ -1122,6 +1167,52 @@ impl Database {
             .map_err(|error| NativeError::new(NativeErrorCode::Internal, error.to_string()))?;
         let mut connection = self.connection();
         let transaction = connection.transaction()?;
+        let owner = transaction
+            .query_row(
+                "SELECT subject FROM sync_state WHERE singleton=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        if owner.is_empty() {
+            transaction.execute(
+                "INSERT INTO profile_sync_policy(profile_id, policy, subject)
+                 VALUES (?1, 'unclaimed', '')
+                 ON CONFLICT(profile_id) DO UPDATE SET policy='unclaimed', subject=''",
+                [&profile.id],
+            )?;
+        }
+        let policy = transaction
+            .query_row(
+                "SELECT policy, subject FROM profile_sync_policy WHERE profile_id=?1",
+                [&profile.id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let policy_matches_owner = policy
+            .as_ref()
+            .is_some_and(|(_, subject)| subject == &owner);
+        let local_only = policy_matches_owner
+            && policy
+                .as_ref()
+                .is_some_and(|(policy, _)| policy == "local-only");
+        let policy_owner_mismatch = !owner.is_empty()
+            && policy
+                .as_ref()
+                .is_some_and(|(_, subject)| subject != &owner);
+        let preserve = policy_matches_owner
+            && policy
+                .as_ref()
+                .is_some_and(|(policy, _)| policy == "consented")
+            || transaction.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM mutation_outbox
+                   WHERE profile_id=?1 AND preserve_on_epoch_adopt=1
+                 )",
+                [&profile.id],
+                |row| row.get::<_, i64>(0),
+            )? == 1;
         transaction.execute(
             "INSERT INTO profiles(id, name, source_path, target_path, exclusions_json, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -1135,20 +1226,25 @@ impl Database {
             "DELETE FROM mutation_quarantine WHERE profile_id = ?1",
             [&profile.id],
         )?;
-        transaction.execute(
-            "INSERT INTO mutation_outbox(
-               mutation_id, kind, payload, occurred_at, profile_id, preserve_on_epoch_adopt
-             ) VALUES (
-               ?1, 'upsert', ?2, ?3, ?4,
-               EXISTS(SELECT 1 FROM mutation_outbox WHERE profile_id=?4 AND preserve_on_epoch_adopt=1)
-             )",
-            params![
-                Uuid::new_v4().to_string(),
-                payload,
-                profile.updated_at,
-                profile.id
-            ],
-        )?;
+        if local_only || policy_owner_mismatch {
+            transaction.execute(
+                "DELETE FROM mutation_outbox WHERE profile_id=?1",
+                [&profile.id],
+            )?;
+        } else {
+            transaction.execute(
+                "INSERT INTO mutation_outbox(
+                   mutation_id, kind, payload, occurred_at, profile_id, preserve_on_epoch_adopt
+                 ) VALUES (?1, 'upsert', ?2, ?3, ?4, ?5)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    payload,
+                    profile.updated_at,
+                    profile.id,
+                    i64::from(preserve)
+                ],
+            )?;
+        }
         transaction.execute(
             "UPDATE sync_state SET session_generation=session_generation + 1 WHERE singleton=1",
             [],
@@ -1181,25 +1277,57 @@ impl Database {
     pub fn delete_profile(&self, id: &str) -> Result<(), NativeError> {
         let mut connection = self.connection();
         let transaction = connection.transaction()?;
+        let owner = transaction
+            .query_row(
+                "SELECT subject FROM sync_state WHERE singleton=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let policy = transaction
+            .query_row(
+                "SELECT policy, subject FROM profile_sync_policy WHERE profile_id=?1",
+                [id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let local_only = policy
+            .as_ref()
+            .is_some_and(|(policy, subject)| policy == "local-only" && subject == &owner);
+        let preserve = policy
+            .as_ref()
+            .is_some_and(|(policy, subject)| policy == "consented" && subject == &owner)
+            || transaction.query_row(
+                "SELECT EXISTS(
+               SELECT 1 FROM mutation_outbox
+               WHERE profile_id=?1 AND preserve_on_epoch_adopt=1
+             )",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )? == 1;
         transaction.execute("DELETE FROM profiles WHERE id = ?1", [id])?;
         transaction.execute(
             "DELETE FROM mutation_quarantine WHERE profile_id = ?1",
             [id],
         )?;
-        transaction.execute(
-            "INSERT INTO mutation_outbox(
-               mutation_id, kind, payload, occurred_at, profile_id, preserve_on_epoch_adopt
-             ) VALUES (
-               ?1, 'delete', ?2, ?3, ?4,
-               EXISTS(SELECT 1 FROM mutation_outbox WHERE profile_id=?4 AND preserve_on_epoch_adopt=1)
-             )",
-            params![
-                Uuid::new_v4().to_string(),
-                json!({ "profileId": id }).to_string(),
-                timestamp(),
-                id
-            ],
-        )?;
+        if local_only {
+            transaction.execute("DELETE FROM mutation_outbox WHERE profile_id=?1", [id])?;
+            transaction.execute("DELETE FROM profile_sync_policy WHERE profile_id=?1", [id])?;
+        } else {
+            transaction.execute(
+                "INSERT INTO mutation_outbox(
+                   mutation_id, kind, payload, occurred_at, profile_id, preserve_on_epoch_adopt
+                 ) VALUES (?1, 'delete', ?2, ?3, ?4, ?5)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    json!({ "profileId": id }).to_string(),
+                    timestamp(),
+                    id,
+                    i64::from(preserve)
+                ],
+            )?;
+        }
         transaction.execute(
             "UPDATE sync_state SET session_generation=session_generation + 1 WHERE singleton=1",
             [],
@@ -1253,7 +1381,7 @@ impl Database {
     pub fn quarantined_mutations(&self) -> Result<Vec<QuarantinedMutation>, NativeError> {
         let connection = self.connection();
         let mut statement = connection.prepare(
-            "SELECT mutation_id, profile_id, reason
+            "SELECT mutation_id, profile_id, reason, provenance
              FROM mutation_quarantine ORDER BY sequence ASC",
         )?;
         let rows = statement.query_map([], |row| {
@@ -1261,6 +1389,7 @@ impl Database {
                 mutation_id: row.get(0)?,
                 profile_id: row.get(1)?,
                 reason: row.get(2)?,
+                provenance: row.get(3)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1316,6 +1445,7 @@ impl Database {
         transaction.execute("DELETE FROM profiles", [])?;
         transaction.execute("DELETE FROM mutation_outbox", [])?;
         transaction.execute("DELETE FROM mutation_quarantine", [])?;
+        transaction.execute("DELETE FROM profile_sync_policy", [])?;
         transaction.execute("DELETE FROM sync_state", [])?;
         transaction.commit()?;
         Ok(())
@@ -1329,6 +1459,18 @@ impl Database {
         let transaction = connection.transaction()?;
         let lifecycle_generation = Uuid::new_v4().to_string();
         transaction.execute("DELETE FROM mutation_outbox", [])?;
+        transaction.execute("DELETE FROM profile_sync_policy", [])?;
+        if !remove_local_profiles {
+            transaction.execute(
+                "INSERT INTO profile_sync_policy(profile_id, policy, subject)
+                 SELECT id, 'unclaimed', '' FROM profiles",
+                [],
+            )?;
+            transaction.execute(
+                "UPDATE mutation_quarantine SET provenance='pre-login', subject=''",
+                [],
+            )?;
+        }
         transaction.execute(
             "INSERT INTO sync_state(singleton, subject, epoch, cursor, session_generation,
              preserve_outbox_on_epoch_adopt, lifecycle_generation)
@@ -1375,14 +1517,89 @@ impl Database {
                 "Local hosted-sync state belongs to another account.",
             ));
         }
-        if owner.as_deref() == Some(subject) {
+        let same_owner = owner.as_deref() == Some(subject);
+        if same_owner && !upload_existing {
             transaction.commit()?;
             return Ok(());
         }
         if !upload_existing {
             transaction.execute("DELETE FROM mutation_outbox", [])?;
+            transaction.execute(
+                "UPDATE profile_sync_policy SET policy='local-only', subject=?1
+                 WHERE policy='unclaimed'",
+                [subject],
+            )?;
         } else {
-            transaction.execute("UPDATE mutation_outbox SET preserve_on_epoch_adopt=1", [])?;
+            let profiles_to_upload = {
+                let mut statement = transaction.prepare(
+                    "SELECT p.id, p.name, p.source_path, p.target_path, p.exclusions_json,
+                            p.created_at, p.updated_at
+                     FROM profiles p
+                     JOIN profile_sync_policy policy ON policy.profile_id=p.id
+                     WHERE policy.policy='unclaimed'
+                        OR (policy.policy='local-only' AND policy.subject=?1)",
+                )?;
+                let rows = statement.query_map([subject], |row| {
+                    let exclusions: String = row.get(4)?;
+                    Ok(Profile {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        source_path: row.get(2)?,
+                        target_path: row.get(3)?,
+                        exclusions: serde_json::from_str(&exclusions).unwrap_or_default(),
+                        created_at: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            if !same_owner {
+                transaction.execute("UPDATE mutation_outbox SET preserve_on_epoch_adopt=1", [])?;
+            }
+            for profile in profiles_to_upload {
+                if validate_profile(&profile).is_err() {
+                    continue;
+                }
+                let already_queued: i64 = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mutation_outbox WHERE profile_id=?1)",
+                    [&profile.id],
+                    |row| row.get(0),
+                )?;
+                if already_queued == 0 {
+                    transaction.execute(
+                        "INSERT INTO mutation_outbox(
+                           mutation_id, kind, payload, occurred_at, profile_id,
+                           preserve_on_epoch_adopt
+                         ) VALUES (?1, 'upsert', ?2, ?3, ?4, 1)",
+                        params![
+                            Uuid::new_v4().to_string(),
+                            serde_json::to_string(&profile).map_err(internal_error)?,
+                            profile.updated_at,
+                            profile.id
+                        ],
+                    )?;
+                }
+            }
+            transaction.execute(
+                "UPDATE profile_sync_policy SET policy='consented', subject=?1
+                 WHERE policy='unclaimed' OR (policy='local-only' AND subject=?1)",
+                [subject],
+            )?;
+        }
+        if same_owner {
+            let lifecycle_generation = Uuid::new_v4().to_string();
+            transaction.execute(
+                "UPDATE sync_state SET
+                   session_generation=session_generation + 1,
+                   preserve_outbox_on_epoch_adopt=CASE WHEN EXISTS(
+                     SELECT 1 FROM mutation_outbox WHERE preserve_on_epoch_adopt=1
+                   ) THEN 1 ELSE preserve_outbox_on_epoch_adopt END,
+                   lifecycle_generation=?1
+                 WHERE singleton=1 AND subject=?2",
+                params![lifecycle_generation, subject],
+            )?;
+            transaction.commit()?;
+            return Ok(());
         }
         let epoch = Uuid::new_v4().to_string();
         let lifecycle_generation = Uuid::new_v4().to_string();
@@ -1418,8 +1635,11 @@ impl Database {
                 .query_row(
                     "SELECT EXISTS(
                     SELECT 1 FROM mutation_outbox WHERE preserve_on_epoch_adopt=1
+                    UNION ALL
+                    SELECT 1 FROM profile_sync_policy
+                    WHERE policy='consented' AND subject=?1
                  ) FROM sync_state
-                 WHERE singleton=1 AND subject=?1 AND preserve_outbox_on_epoch_adopt=1",
+                 WHERE singleton=1 AND subject=?1",
                     [subject],
                     |row| row.get::<_, i64>(0),
                 )
@@ -1436,6 +1656,7 @@ impl Database {
         if remove_local_profiles {
             transaction.execute("DELETE FROM profiles", [])?;
             transaction.execute("DELETE FROM mutation_quarantine", [])?;
+            transaction.execute("DELETE FROM profile_sync_policy", [])?;
         }
         let lifecycle_generation = Uuid::new_v4().to_string();
         transaction.execute(
@@ -1463,8 +1684,11 @@ impl Database {
             .query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM mutation_outbox WHERE preserve_on_epoch_adopt=1
+                    UNION ALL
+                    SELECT 1 FROM profile_sync_policy
+                    WHERE policy='consented' AND subject=?1
                  ) FROM sync_state
-                 WHERE singleton=1 AND subject=?1 AND preserve_outbox_on_epoch_adopt=1",
+                 WHERE singleton=1 AND subject=?1",
                 [subject],
                 |row| row.get::<_, i64>(0),
             )
@@ -1507,6 +1731,18 @@ impl Database {
         if remove_local_profiles {
             transaction.execute("DELETE FROM profiles", [])?;
             transaction.execute("DELETE FROM mutation_quarantine", [])?;
+            transaction.execute("DELETE FROM profile_sync_policy", [])?;
+        } else {
+            transaction.execute("DELETE FROM profile_sync_policy", [])?;
+            transaction.execute(
+                "INSERT INTO profile_sync_policy(profile_id, policy, subject)
+                 SELECT id, 'local-only', ?1 FROM profiles",
+                [expected_subject],
+            )?;
+            transaction.execute(
+                "UPDATE mutation_quarantine SET subject=?1 WHERE provenance='pre-login'",
+                [expected_subject],
+            )?;
         }
         let lifecycle_generation = Uuid::new_v4().to_string();
         transaction.execute(
@@ -1532,7 +1768,28 @@ impl Database {
         expected_lifecycle_generation: Option<&str>,
     ) -> Result<(serde_json::Value, String), NativeError> {
         let mut connection = self.connection();
+        let claim_required_before_quarantine: i64 = connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM mutation_outbox
+               UNION ALL
+               SELECT 1 FROM profile_sync_policy WHERE policy='unclaimed'
+               UNION ALL
+               SELECT 1 FROM mutation_quarantine WHERE provenance='pre-login'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
         quarantine_invalid_outbox(&mut connection)?;
+        let account_claim_required = claim_required_before_quarantine == 1
+            || connection.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM profile_sync_policy WHERE policy='unclaimed'
+                   UNION ALL
+                   SELECT 1 FROM mutation_quarantine WHERE provenance='pre-login'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? == 1;
         let device_id: String = match connection
             .query_row(
                 "SELECT value FROM settings WHERE key='device_id'",
@@ -1597,7 +1854,7 @@ impl Database {
                         (epoch, cursor, lifecycle_generation)
                     }
                     Some((owner, _, _, _)) if owner.is_empty() => {
-                        if !pending.is_empty() {
+                        if account_claim_required {
                             return Err(NativeError::new(
                                 NativeErrorCode::SyncAccountClaimRequired,
                                 "Choose whether this account may upload existing local profiles.",
@@ -1621,7 +1878,7 @@ impl Database {
                         ))
                     }
                     None => {
-                        if !pending.is_empty() {
+                        if account_claim_required {
                             return Err(NativeError::new(
                                 NativeErrorCode::SyncAccountClaimRequired,
                                 "Choose whether this account may upload existing local profiles.",
@@ -1827,6 +2084,14 @@ impl Database {
                     )
                 })?;
             transaction.execute(
+                "DELETE FROM profile_sync_policy
+                 WHERE policy='consented' AND subject=?1
+                   AND profile_id=(
+                     SELECT profile_id FROM mutation_outbox WHERE mutation_id=?2
+                   )",
+                params![expected_subject, mutation_id],
+            )?;
+            transaction.execute(
                 "DELETE FROM mutation_outbox WHERE mutation_id = ?1",
                 [mutation_id],
             )?;
@@ -1845,7 +2110,13 @@ impl Database {
                     .map_err(internal_error)?;
                     validate_profile(&profile)?;
                     let has_pending_local_mutation: i64 = transaction.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM mutation_outbox WHERE profile_id=?1)",
+                        "SELECT EXISTS(
+                           SELECT 1 FROM mutation_outbox WHERE profile_id=?1
+                           UNION ALL
+                           SELECT 1 FROM mutation_quarantine WHERE profile_id=?1
+                           UNION ALL
+                           SELECT 1 FROM profile_sync_policy WHERE profile_id=?1
+                         )",
                         [&profile.id],
                         |row| row.get(0),
                     )?;
@@ -1872,7 +2143,13 @@ impl Database {
                             )
                         })?;
                     let has_pending_local_mutation: i64 = transaction.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM mutation_outbox WHERE profile_id=?1)",
+                        "SELECT EXISTS(
+                           SELECT 1 FROM mutation_outbox WHERE profile_id=?1
+                           UNION ALL
+                           SELECT 1 FROM mutation_quarantine WHERE profile_id=?1
+                           UNION ALL
+                           SELECT 1 FROM profile_sync_policy WHERE profile_id=?1
+                         )",
                         [profile_id],
                         |row| row.get(0),
                     )?;
@@ -1894,7 +2171,10 @@ impl Database {
              preserve_outbox_on_epoch_adopt=CASE
                WHEN EXISTS(
                  SELECT 1 FROM mutation_outbox WHERE preserve_on_epoch_adopt=1
-               ) THEN preserve_outbox_on_epoch_adopt
+                 UNION ALL
+                 SELECT 1 FROM profile_sync_policy
+                 WHERE policy='consented' AND subject=?2
+               ) THEN 1
                ELSE 0
              END
              WHERE singleton = 1 AND subject = ?2 AND epoch = ?3 AND cursor = ?4 AND session_generation = ?5",

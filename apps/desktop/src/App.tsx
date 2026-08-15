@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { PROFILE_LIMITS, validateSyncProfile } from "@rootline/contracts";
+import { validateSyncProfile } from "@rootline/contracts";
 
 import { DiffTree } from "./components/DiffTree";
 import { AuthControls } from "./components/AuthControls";
@@ -433,8 +433,6 @@ export function App({ gateway = tauriGateway, initialProfile, auth, syncCoordina
                   id={profileNameId}
                   value={profileName}
                   required
-                  minLength={PROFILE_LIMITS.name.min}
-                  maxLength={PROFILE_LIMITS.name.max}
                   onChange={(event) => setProfileName(event.currentTarget.value)}
                 />
                 <button type="button" className="secondary-button" disabled={!sourcePath || !targetPath} onClick={() => void saveProfile()}>{text.save}</button>

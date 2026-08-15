@@ -288,6 +288,7 @@ export class DesktopAuthController implements AuthController {
       this.update({ ...withoutAuthError(this.current), loading: false, signInPending: true });
       this.signInTimer = setTimeout(() => {
         if (generation !== this.signInGeneration) return;
+        this.signInGeneration += 1;
         this.signInTimer = undefined;
         this.update({ ...this.current, loading: false, signInPending: false, error: "AUTH_SIGNIN_TIMEOUT" });
         void this.queueSignInStateDiscard();
@@ -338,17 +339,23 @@ export class DesktopAuthController implements AuthController {
   }
 
   private async processCallback(rawUrl: string): Promise<void> {
+    const lifecycleGeneration = this.signInGeneration;
     try {
       const url = validateCallbackUrl(rawUrl);
       const state = url.searchParams.get("state")!;
       if (this.processedCallbackStates.has(state)) return;
       this.processedCallbackStates.add(state);
       const user = await this.manager.signinRedirectCallback(url.toString());
+      if (lifecycleGeneration !== this.signInGeneration) {
+        try { await this.manager.removeUser(); } catch { /* stale callbacks must never restore a session */ }
+        return;
+      }
       this.signInGeneration += 1;
       this.clearSignInTimer();
       this.update({ configured: true, loading: false, signInPending: false, user: projectUser(user), dataVersion: this.current.dataVersion });
       try { await this.sync(); } catch { /* sync() already surfaces reset-required; offline sign-in remains valid */ }
     } catch (error) {
+      if (lifecycleGeneration !== this.signInGeneration) return;
       this.update({
         configured: true,
         loading: false,

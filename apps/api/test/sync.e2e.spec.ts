@@ -277,20 +277,21 @@ describe("Rootline hosted sync (real PostgreSQL)", () => {
 
   test("enforces the shared profile limits at their exact boundaries", async () => {
     const auth = await token("profile-limit-user");
-    const boundary = mutation(PROFILE_ID, "n".repeat(80), "00000000-0000-4000-8000-000000000521");
-    boundary.profile.sourcePath = "s".repeat(4096);
-    boundary.profile.targetPath = "t".repeat(4096);
-    boundary.profile.exclusions = Array.from({ length: 100 }, () => "x".repeat(256));
+    const exactCodePoints = (count: number) => "✈️".repeat(Math.floor(count / 2)) + (count % 2 ? "x" : "");
+    const boundary = mutation(PROFILE_ID, exactCodePoints(80), "00000000-0000-4000-8000-000000000521");
+    boundary.profile.sourcePath = exactCodePoints(4096);
+    boundary.profile.targetPath = exactCodePoints(4096);
+    boundary.profile.exclusions = Array.from({ length: 100 }, () => exactCodePoints(256));
     await request(fixture.server).post("/v1/sync").set("Authorization", `Bearer ${auth}`)
       .send({ deviceId: "profile-limits", epoch: EPOCH, mutations: [boundary] }).expect(200);
 
     const invalidProfiles = [
-      { ...boundary.profile, name: "n".repeat(81) },
+      { ...boundary.profile, name: exactCodePoints(81) },
       { ...boundary.profile, sourcePath: "" },
-      { ...boundary.profile, targetPath: "t".repeat(4097) },
+      { ...boundary.profile, targetPath: exactCodePoints(4097) },
       { ...boundary.profile, exclusions: Array.from({ length: 101 }, () => "x") },
       { ...boundary.profile, exclusions: [""] },
-      { ...boundary.profile, exclusions: ["x".repeat(257)] },
+      { ...boundary.profile, exclusions: [exactCodePoints(257)] },
     ];
     for (const [index, profile] of invalidProfiles.entries()) {
       const invalid = {
