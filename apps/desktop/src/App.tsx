@@ -38,12 +38,7 @@ function operationId(prefix: string): string {
 
 function Mark(): React.JSX.Element {
   return (
-    <svg className="brand-mark" aria-hidden="true" viewBox="0 0 48 48">
-      <path className="mark-soft" d="M13 9h13a8 8 0 0 1 8 8v2" />
-      <path className="mark-line" d="M13 9v30M13 23h21M13 39h13" />
-      <circle className="mark-moss" cx="34" cy="23" r="3.5" />
-      <circle className="mark-amber" cx="26" cy="39" r="3.5" />
-    </svg>
+    <img className="brand-mark" src={`${import.meta.env.BASE_URL}brand/logo.svg`} width={38} height={38} alt="" />
   );
 }
 

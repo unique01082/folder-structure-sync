@@ -1,5 +1,7 @@
 # Rootline by baole.space
 
+![Rootline brand](docs/brand/logo.svg)
+
 Rootline safely reproduces a directory structure from one location into another without copying files or deleting existing content.
 
 > **Release status:** `2.0.0` is a release candidate. Stable npm and desktop downloads are available only after the fail-closed release workflows complete with real signing and deployment credentials. Check [GitHub Releases](https://github.com/unique01082/folder-structure-sync/releases) and [npm](https://www.npmjs.com/package/folder-structure-sync) before installing; this repository does not claim unpublished artifacts are live.
